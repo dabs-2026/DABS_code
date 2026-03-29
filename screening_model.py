@@ -6,6 +6,7 @@ import pyro.distributions as dist
 
 from oed.primitives import observation_sample, latent_sample, compute_design
 
+
 class ScreeningExperiment(nn.Module):
     def __init__(
         self,
@@ -13,6 +14,8 @@ class ScreeningExperiment(nn.Module):
         num_factors=20,
         T=10,
         expected_active_proportion=0.2,
+        pi_beta_a=0.0,
+        pi_beta_b=0.0,
         scale_active=1.0,
         scale_inactive=0.01,
         noise_scale=0.5,
@@ -21,7 +24,10 @@ class ScreeningExperiment(nn.Module):
         self.design_net = design_net
         self.num_factors = num_factors
         self.T = T
-        self.pi = expected_active_proportion
+        self.pi_fixed = expected_active_proportion
+        self.pi_beta_a = pi_beta_a
+        self.pi_beta_b = pi_beta_b
+        self.use_pi_hyperprior = (pi_beta_a > 0.0 and pi_beta_b > 0.0)
         self.scale_active = scale_active
         self.scale_inactive = scale_inactive
         self.register_buffer('noise_scale', torch.tensor(noise_scale))
@@ -33,26 +39,46 @@ class ScreeningExperiment(nn.Module):
         ]
         self.num_interactions = len(self.interaction_pairs)
 
-    def _sample_theta(self):
+    def _sample_pi(self):
+        if self.use_pi_hyperprior:
+            pi = latent_sample(
+                "pi",
+                dist.Beta(
+                    torch.tensor(self.pi_beta_a, device=self.noise_scale.device),
+                    torch.tensor(self.pi_beta_b, device=self.noise_scale.device),
+                )
+            )
+        else:
+            pi = self.pi_fixed
+        return pi
+
+    def _sample_theta(self, pi):
+        device = self.noise_scale.device
+        pi_vec = (
+            pi.unsqueeze(-1).expand(*pi.shape, self.num_factors)
+            if isinstance(pi, torch.Tensor) and pi.dim() > 0
+            else pi * torch.ones(self.num_factors, device=device)
+        )
+
         z = latent_sample(
             "z",
-            dist.Bernoulli(
-                self.pi * torch.ones(self.num_factors, device=self.noise_scale.device)
-            ).to_event(1)
+            dist.Bernoulli(pi_vec).to_event(1),
+            infer={"subtype": "target"}
         )
 
         scale_main = torch.where(
             z.bool(),
-            torch.tensor(self.scale_active, device=z.device),
-            torch.tensor(self.scale_inactive, device=z.device)
+            torch.tensor(self.scale_active, device=device),
+            torch.tensor(self.scale_inactive, device=device)
         )
         theta_main = latent_sample(
             "theta_main",
             dist.Normal(
-                torch.zeros(self.num_factors, device=z.device),
+                torch.zeros(self.num_factors, device=device),
                 scale_main
             ).to_event(1)
         )
+
         interact_active = torch.stack([
             z[..., i] * z[..., j]
             for i, j in self.interaction_pairs
@@ -60,13 +86,13 @@ class ScreeningExperiment(nn.Module):
 
         scale_interact = torch.where(
             interact_active.bool(),
-            torch.tensor(self.scale_active, device=z.device),
-            torch.tensor(self.scale_inactive, device=z.device)
+            torch.tensor(self.scale_active, device=device),
+            torch.tensor(self.scale_inactive, device=device)
         )
         theta_interact = latent_sample(
             "theta_interact",
             dist.Normal(
-                torch.zeros(self.num_interactions, device=z.device),
+                torch.zeros(self.num_interactions, device=device),
                 scale_interact
             ).to_event(1)
         )
@@ -74,7 +100,7 @@ class ScreeningExperiment(nn.Module):
 
     def _forward_map(self, xi, theta_main, theta_interact):
         xi = xi.to(theta_main.device)
-        
+
         while xi.dim() < theta_main.dim():
             xi = xi.unsqueeze(-2)
 
@@ -93,7 +119,8 @@ class ScreeningExperiment(nn.Module):
         if hasattr(self.design_net, "parameters"):
             pyro.module("design_net", self.design_net)
 
-        z, theta_main, theta_interact = self._sample_theta()
+        pi = self._sample_pi()
+        z, theta_main, theta_interact = self._sample_theta(pi)
 
         y_outcomes = []
         xi_designs = []
@@ -103,14 +130,11 @@ class ScreeningExperiment(nn.Module):
                 f"xi{t + 1}",
                 self.design_net.lazy(*zip(xi_designs, y_outcomes))
             )
-
             mean_y = self._forward_map(xi, theta_main, theta_interact)
-
             y = observation_sample(
                 f"y{t + 1}",
                 dist.Normal(mean_y, self.noise_scale)
             )
-
             y_outcomes.append(y)
             xi_designs.append(xi.detach())
 
@@ -159,6 +183,9 @@ class ScreeningExperiment(nn.Module):
                 active_factors = true_z.nonzero(as_tuple=True)[0].tolist()
 
                 if verbose:
+                    if self.use_pi_hyperprior:
+                        pi_val = trace.nodes["pi"]["value"].cpu().item()
+                        print(f"  Sampled pi:     {pi_val:.3f}")
                     print(f"  Active factors: {active_factors}")
                     print(f"  theta_main:     {true_theta_main.round(decimals=2)}")
 

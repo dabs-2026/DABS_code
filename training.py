@@ -22,22 +22,26 @@ from screening_model import ScreeningExperiment
 def single_run(
     seed,
     num_steps,
-    num_inner_samples,          # L in denominator of sPCE
-    num_outer_samples,          # N for outer expectation
-    lr,                         # Adam learning rate
-    gamma,                      # LR decay factor per 1000 steps
-    num_factors,                # number of screening factors p
-    T,                          # number of sequential experiments
-    noise_scale,                # observation noise std
-    expected_active_proportion, # prior prob each factor is active
-    scale_active,               # prior std for active effects
-    scale_inactive,             # prior std for inactive effects
-    hidden_dim,                 # hidden dim of encoder/emitter
-    encoding_dim,               # encoding dim of encoder output
-    design_network_type,        # "dad", "static", or "random"
-    device,                     # "cpu" or "cuda"
-    output_dir,                 # directory to save results
-    adam_betas_wd=None,         # [beta1, beta2, weight_decay]
+    num_inner_samples,
+    num_outer_samples,
+    lr,
+    gamma,
+    num_factors,
+    T,
+    noise_scale,
+    expected_active_proportion,
+    scale_active,
+    scale_inactive,
+    hidden_dim,
+    encoding_dim,
+    design_network_type,
+    device,
+    output_dir,
+    adam_betas_wd=None,
+    pi_beta_a=0.0,
+    pi_beta_b=0.0,
+    diversity_penalty=0.1,
+    encoder_type="original",
 ):
     if adam_betas_wd is None:
         adam_betas_wd = [0.9, 0.999, 0]
@@ -55,6 +59,7 @@ def single_run(
             num_factors=num_factors,
             encoding_dim=encoding_dim,
             hidden_dim=hidden_dim,
+            encoder_type=encoder_type,
         ).to(device)
 
     elif design_network_type == "static":
@@ -80,6 +85,8 @@ def single_run(
         num_factors=num_factors,
         T=T,
         expected_active_proportion=expected_active_proportion,
+        pi_beta_a=pi_beta_a,
+        pi_beta_b=pi_beta_b,
         scale_active=scale_active,
         scale_inactive=scale_inactive,
         noise_scale=noise_scale,
@@ -99,7 +106,11 @@ def single_run(
 
     pce_loss = PriorContrastiveEstimationScoreGradient(
         num_outer_samples,
-        num_inner_samples
+        num_inner_samples,
+        scale_active=scale_active,
+        scale_inactive=scale_inactive,
+        noise_scale=noise_scale,
+        diversity_penalty=diversity_penalty,
     )
 
     oed = OED(screening_model.model, scheduler, pce_loss)
@@ -113,9 +124,12 @@ def single_run(
         "T": T,
         "noise_scale": noise_scale,
         "expected_active_proportion": expected_active_proportion,
+        "pi_beta_a": pi_beta_a,
+        "pi_beta_b": pi_beta_b,
         "scale_active": scale_active,
         "scale_inactive": scale_inactive,
         "design_network_type": design_network_type,
+        "encoder_type": encoder_type,
         "hidden_dim": hidden_dim,
         "encoding_dim": encoding_dim,
         "num_outer_samples": num_outer_samples,
@@ -126,6 +140,7 @@ def single_run(
         "adam_beta1": adam_betas[0],
         "adam_beta2": adam_betas[1],
         "adam_weight_decay": adam_weight_decay,
+        "diversity_penalty": diversity_penalty,
     }
 
     print("\n" + "=" * 55)
@@ -195,6 +210,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-experiments", default=10, type=int)
     parser.add_argument("--noise-scale", default=0.5, type=float)
     parser.add_argument("--expected-active", default=0.2, type=float)
+    parser.add_argument("--pi-beta-a", default=0.0, type=float,
+                        help="Beta hyperprior shape a for pi (0 = fixed pi)")
+    parser.add_argument("--pi-beta-b", default=0.0, type=float,
+                        help="Beta hyperprior shape b for pi (0 = fixed pi)")
     parser.add_argument("--scale-active", default=1.0, type=float)
     parser.add_argument("--scale-inactive", default=0.01, type=float)
 
@@ -210,6 +229,11 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", default=0.95, type=float)
     parser.add_argument("--adam-betas-wd", nargs="+", type=float,
                         default=[0.9, 0.999, 0])
+    parser.add_argument("--diversity-penalty", default=0.1, type=float,
+                        help="Weight of the diversity penalty in REINFORCE loss")
+    parser.add_argument("--encoder-type", default="original", type=str,
+                        choices=["original", "suff"],
+                        help="original = MLP sum pooling, suff = sufficient stats")
 
     parser.add_argument("--device", default="cpu", type=str)
     parser.add_argument("--output-dir", default="results", type=str)
@@ -227,6 +251,9 @@ if __name__ == "__main__":
         T=args.num_experiments,
         noise_scale=args.noise_scale,
         expected_active_proportion=args.expected_active,
+        pi_beta_a=args.pi_beta_a,
+        pi_beta_b=args.pi_beta_b,
+        encoder_type=args.encoder_type,
         scale_active=args.scale_active,
         scale_inactive=args.scale_inactive,
         hidden_dim=args.hidden_dim,
@@ -235,4 +262,5 @@ if __name__ == "__main__":
         device=args.device,
         output_dir=args.output_dir,
         adam_betas_wd=args.adam_betas_wd,
+        diversity_penalty=args.diversity_penalty,
     )

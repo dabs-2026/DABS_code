@@ -1,15 +1,69 @@
 import math
 
 import torch
-from torch.distributions.utils import broadcast_all
 
 import pyro
 from pyro import poutine
 from pyro.poutine.util import prune_subsample_sites
 from pyro.util import warn_if_nan
 from pyro.infer.util import torch_item
-from pyro.contrib.util import lexpand, rexpand
+from pyro.contrib.util import lexpand
 
+def _log_py_given_z_analytical(
+    y,
+    xi_list,
+    z_outer,
+    scale_active,
+    scale_inactive,
+    noise_scale,
+):
+    num_outer, S, p = z_outer.shape
+    T = y.shape[1]
+
+    X = torch.stack(xi_list, dim=1).float()
+
+    prior_var = torch.where(
+        z_outer.bool(),
+        torch.tensor(scale_active ** 2,   device=z_outer.device),
+        torch.tensor(scale_inactive ** 2, device=z_outer.device),
+    )
+
+    X_exp = X.unsqueeze(1)
+    Xv    = X_exp * prior_var.unsqueeze(2)
+    K     = torch.matmul(Xv, X_exp.transpose(-1, -2))
+    eye   = torch.eye(T, device=K.device).unsqueeze(0).unsqueeze(0)
+    K     = K + noise_scale ** 2 * eye
+
+    y_exp  = y.unsqueeze(1).expand(num_outer, S, T)
+    K_flat = K.reshape(num_outer * S, T, T)
+    y_flat = y_exp.reshape(num_outer * S, T)
+    zeros  = torch.zeros(num_outer * S, T, device=y.device)
+
+    try:
+        mvn   = torch.distributions.MultivariateNormal(zeros, covariance_matrix=K_flat)
+        log_p = mvn.log_prob(y_flat)
+    except Exception:
+        K_flat = K_flat + 1e-6 * torch.eye(T, device=K_flat.device).unsqueeze(0)
+        mvn    = torch.distributions.MultivariateNormal(zeros, covariance_matrix=K_flat)
+        log_p  = mvn.log_prob(y_flat)
+
+    return log_p.reshape(num_outer, S)
+
+
+def _extract_y_and_xi(primary_trace, num_outer, T):
+    y_list, xi_list = [], []
+    for t in range(1, T + 1):
+        y_node  = primary_trace.nodes.get(f"y{t}")
+        xi_node = primary_trace.nodes.get(f"xi{t}")
+        if y_node is None or xi_node is None:
+            break
+        y_list.append(y_node["value"].float())
+        xi_list.append(xi_node["value"].float())
+
+    y = torch.stack(
+        [v.squeeze(-1) if v.dim() > 1 else v for v in y_list], dim=-1
+    )
+    return y, xi_list
 
 class MutualInformation(object):
     def __init__(self, num_outer_samples, data_source=None):
@@ -20,7 +74,6 @@ class MutualInformation(object):
         def wrapped_fn(*args, **kwargs):
             with pyro.plate_stack(name, shape):
                 return fn(*args, **kwargs)
-
         return wrapped_fn
 
     def get_primary_rollout(self, model, args, kwargs, graph_type="flat", detach=False):
@@ -36,7 +89,6 @@ class MutualInformation(object):
                 ),
                 data=data,
             )
-
         trace = poutine.trace(model, graph_type=graph_type).get_trace(*args, **kwargs)
         if detach:
             trace.detach_()
@@ -45,112 +97,118 @@ class MutualInformation(object):
         return trace
 
 class PriorContrastiveEstimation(MutualInformation):
-    def __init__(self, num_outer_samples=100, num_inner_samples=10, data_source=None):
+
+    def __init__(self, num_outer_samples=100, num_inner_samples=10,
+                 data_source=None,
+                 scale_active=1.0, scale_inactive=0.01, noise_scale=0.5):
         super().__init__(num_outer_samples, data_source=data_source)
         self.num_inner_samples = num_inner_samples
+        self.scale_active      = scale_active
+        self.scale_inactive    = scale_inactive
+        self.noise_scale       = noise_scale
 
-    def compute_observation_log_prob(self, trace):
-        return sum(
-            node["log_prob"]
-            for node in trace.nodes.values()
-            if node.get("subtype") == "observation_sample"
+    def _analytical_log_prob(self, primary_trace, num_z_contrastive, p, T):
+        y, xi_list = _extract_y_and_xi(primary_trace, self.num_outer_samples, T)
+        z_pos        = primary_trace.nodes["z"]["value"].float()
+        z_pos_exp    = z_pos.unsqueeze(1)
+        log_py_z_pos = _log_py_given_z_analytical(
+            y, xi_list, z_pos_exp,
+            self.scale_active, self.scale_inactive, self.noise_scale,
+        ).squeeze(1)
+
+        z_fn = primary_trace.nodes["z"]["fn"]
+        pi   = (z_fn.base_dist.probs
+                if hasattr(z_fn, "base_dist")
+                else z_fn.probs)
+        z_con = torch.bernoulli(
+            pi.unsqueeze(1).expand(-1, num_z_contrastive, -1)
+        )
+        log_py_z_con = _log_py_given_z_analytical(
+            y, xi_list, z_con,
+            self.scale_active, self.scale_inactive, self.noise_scale,
         )
 
-    def get_contrastive_rollout(
-        self,
-        trace,
-        model,
-        args,
-        kwargs,
-        existing_vectorization,
-        graph_type="flat",
-        detach=False,
-    ):
-        sampled_observation_values = {
-            name: lexpand(node["value"], self.num_inner_samples)
-            for name, node in trace.nodes.items()
-            if node.get("subtype") in ["observation_sample", "design_sample"]
-        }
-        conditional_model = self._vectorized(
-            pyro.condition(model, data=sampled_observation_values),
-            self.num_inner_samples,
-            *existing_vectorization,
-            name="inner_vectorization",
-        )
-        trace = poutine.trace(conditional_model, graph_type=graph_type).get_trace(
-            *args, **kwargs
-        )
-        if detach:
-            trace.detach_()
-        trace = prune_subsample_sites(trace)
-        trace.compute_log_prob()
-
-        return trace
+        return log_py_z_pos, log_py_z_con
 
     def differentiable_loss(self, model, *args, **kwargs):
         primary_trace = self.get_primary_rollout(model, args, kwargs)
-        contrastive_trace = self.get_contrastive_rollout(
-            primary_trace, model, args, kwargs, [self.num_outer_samples]
+        T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
+        p = primary_trace.nodes["z"]["value"].shape[-1]
+
+        log_py_z_pos, log_py_z_con = self._analytical_log_prob(
+            primary_trace, self.num_inner_samples, p, T
         )
 
-        obs_log_prob_primary = self.compute_observation_log_prob(primary_trace)
-        obs_log_prob_contrastive = self.compute_observation_log_prob(contrastive_trace)
+        log_py_z_pos_exp = log_py_z_pos.unsqueeze(1)
+        log_py_combined  = torch.cat(
+            [log_py_z_pos_exp, log_py_z_con], dim=1
+        ).logsumexp(1) 
 
-        obs_log_prob_combined = torch.cat(
-            [lexpand(obs_log_prob_primary, 1), obs_log_prob_contrastive]
-        ).logsumexp(0)
-
-        loss = (obs_log_prob_combined - obs_log_prob_primary).mean(0)
-
+        loss = (log_py_combined - log_py_z_pos).mean(0)
         warn_if_nan(loss, "loss")
         return loss
 
     def loss(self, model, *args, **kwargs):
-        loss_to_constant = torch_item(self.differentiable_loss(model, *args, **kwargs))
-        return loss_to_constant - math.log(self.num_inner_samples + 1)
+        loss_val = torch_item(self.differentiable_loss(model, *args, **kwargs))
+        return loss_val - math.log(self.num_inner_samples + 1)
 
 class NestedMonteCarloEstimation(PriorContrastiveEstimation):
+
     def differentiable_loss(self, model, *args, **kwargs):
         primary_trace = self.get_primary_rollout(model, args, kwargs)
-        contrastive_trace = self.get_contrastive_rollout(
-            primary_trace, model, args, kwargs, [self.num_outer_samples]
+        T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
+        p = primary_trace.nodes["z"]["value"].shape[-1]
+
+        log_py_z_pos, log_py_z_con = self._analytical_log_prob(
+            primary_trace, self.num_inner_samples, p, T
         )
 
-        obs_log_prob_primary = self.compute_observation_log_prob(primary_trace)
-        obs_log_prob_contrastive = self.compute_observation_log_prob(contrastive_trace)
-        obs_log_prob_combined = obs_log_prob_contrastive.logsumexp(0)
-        loss = (obs_log_prob_combined - obs_log_prob_primary).mean(0)
-
+        log_py_combined = log_py_z_con.logsumexp(1)
+        loss = (log_py_combined - log_py_z_pos).mean(0)
         warn_if_nan(loss, "loss")
         return loss
 
     def loss(self, model, *args, **kwargs):
-        loss_to_constant = torch_item(self.differentiable_loss(model, *args, **kwargs))
-        return loss_to_constant - math.log(self.num_inner_samples)
+        loss_val = torch_item(self.differentiable_loss(model, *args, **kwargs))
+        return loss_val - math.log(self.num_inner_samples)
 
 class PriorContrastiveEstimationScoreGradient(PriorContrastiveEstimation):
-    def __init__(self, num_outer_samples, num_inner_samples):
+    def __init__(self, num_outer_samples, num_inner_samples,
+                scale_active=1.0, scale_inactive=0.01, noise_scale=0.5,
+                diversity_penalty=0.1):
         super().__init__(
-            num_outer_samples=num_outer_samples, 
-            num_inner_samples=num_inner_samples
+            num_outer_samples=num_outer_samples,
+            num_inner_samples=num_inner_samples,
+            scale_active=scale_active,
+            scale_inactive=scale_inactive,
+            noise_scale=noise_scale,
         )
+        self.diversity_penalty = diversity_penalty
 
     def differentiable_loss(self, model, *args, **kwargs):
         primary_trace = self.get_primary_rollout(model, args, kwargs)
-        contrastive_trace = self.get_contrastive_rollout(
-            primary_trace, model, args, kwargs, [self.num_outer_samples]
+        T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
+        p = primary_trace.nodes["z"]["value"].shape[-1]
+
+        log_py_z_pos, log_py_z_con = self._analytical_log_prob(
+            primary_trace, self.num_inner_samples, p, T
         )
 
-        obs_log_prob_primary = self.compute_observation_log_prob(primary_trace)
-        obs_log_prob_contrastive = self.compute_observation_log_prob(contrastive_trace)
-        obs_log_prob_combined = torch.cat(
-            [lexpand(obs_log_prob_primary, 1), obs_log_prob_contrastive]
-        ).logsumexp(0)
+        log_py_z_pos_exp = log_py_z_pos.unsqueeze(1)
+        log_py_combined  = torch.cat(
+            [log_py_z_pos_exp, log_py_z_con], dim=1
+        ).logsumexp(1)
 
         with torch.no_grad():
-            g_no_grad = obs_log_prob_primary - obs_log_prob_combined
+            g_no_grad = log_py_z_pos - log_py_combined
 
-        loss = -(g_no_grad * obs_log_prob_primary - obs_log_prob_combined).mean(0)
+        design_log_probs = sum(
+            node["log_prob"]
+            for node in primary_trace.nodes.values()
+            if node.get("subtype") == "design_sample"
+        )
+
+        loss = -(g_no_grad * design_log_probs - log_py_combined).mean(0)
 
         design_sites = [
             name for name in primary_trace.nodes
@@ -163,14 +221,14 @@ class PriorContrastiveEstimationScoreGradient(PriorContrastiveEstimation):
             ], dim=0)
             d1 = designs[:-1]
             d2 = designs[1:]
-            similarity = (d1 * d2).sum(-1) / (d1.norm(dim=-1) * d2.norm(dim=-1) + 1e-8)
-            diversity_penalty = similarity.mean()
-            loss = loss + 0.1 * diversity_penalty
+            similarity = (d1 * d2).sum(-1) / (
+                d1.norm(dim=-1) * d2.norm(dim=-1) + 1e-8
+            )
+            loss = loss + self.diversity_penalty * similarity.mean()
 
         warn_if_nan(loss, "loss")
         return loss
 
     def loss(self, model, *args, **kwargs):
-        basic_pce = super().differentiable_loss(model, *args, **kwargs)
-        loss_to_constant = torch_item(basic_pce)
-        return loss_to_constant - math.log(self.num_inner_samples + 1)
+        loss_val = torch_item(self.differentiable_loss(model, *args, **kwargs))
+        return loss_val - math.log(self.num_inner_samples + 1)

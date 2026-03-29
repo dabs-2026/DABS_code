@@ -31,6 +31,7 @@ def build_design_matrix(designs, interaction_pairs):
         X = X_main
     return X
 
+
 def gibbs_sampler(
     designs,
     observations,
@@ -41,7 +42,7 @@ def gibbs_sampler(
     p = screening_model.num_factors
     interaction_pairs = screening_model.interaction_pairs
     num_interactions = len(interaction_pairs)
-    pi = screening_model.pi
+    pi = screening_model.pi_fixed
     scale_active = screening_model.scale_active
     scale_inactive = screening_model.scale_inactive
     sigma2 = screening_model.noise_scale.item() ** 2
@@ -219,6 +220,7 @@ def report_results(true_z, true_theta_main, z_samples, theta_samples,
     print(f"  Precision: {precision:.2f}")
     print(f"  Recall:    {recall:.2f}")
     print(f"  F1 score:  {f1:.2f}")
+
     delta = 1.0
     significant_active = [
         k for k in true_active
@@ -246,6 +248,7 @@ def report_results(true_z, true_theta_main, z_samples, theta_samples,
         print(f"  F1 score:  {sig_f1:.2f}")
     else:
         print(f"\nPractical Metrics (|θ| > {delta}): no significant active factors in this run")
+
     if len(true_active) > 0:
         print(f"\nEffect Size Estimates (truly active factors):")
         print(f"  {'Factor':>6}  {'True θ':>8}  {'Post.mean':>10}  {'95% CI':>22}  {'OK':>4}")
@@ -262,6 +265,7 @@ def report_results(true_z, true_theta_main, z_samples, theta_samples,
 
     print("=" * 60)
     return precision, recall, f1
+
 
 def evaluate(
     model_path,
@@ -288,11 +292,12 @@ def evaluate(
     checkpoint = torch.load(model_path, map_location="cpu")
     saved_params = checkpoint.get("params", {})
 
-    num_factors  = saved_params.get("num_factors", num_factors)
-    T            = saved_params.get("T", T)
-    encoding_dim = saved_params.get("encoding_dim", encoding_dim)
-    hidden_dim   = saved_params.get("hidden_dim", hidden_dim)
-    noise_scale  = saved_params.get("noise_scale", noise_scale)
+    num_factors   = saved_params.get("num_factors",   num_factors)
+    T             = saved_params.get("T",             T)
+    encoding_dim  = saved_params.get("encoding_dim",  encoding_dim)
+    hidden_dim    = saved_params.get("hidden_dim",    hidden_dim)
+    noise_scale   = saved_params.get("noise_scale",   noise_scale)
+    encoder_type  = saved_params.get("encoder_type",  "original")
     expected_active_proportion = saved_params.get(
         "expected_active_proportion", expected_active_proportion
     )
@@ -301,6 +306,7 @@ def evaluate(
         num_factors=num_factors,
         encoding_dim=encoding_dim,
         hidden_dim=hidden_dim,
+        encoder_type=encoder_type,
     )
     screening_model = ScreeningExperiment(
         design_net=design_net,
@@ -313,7 +319,7 @@ def evaluate(
     )
     screening_model.load_state_dict(checkpoint["model_state_dict"])
     screening_model.eval()
-    print(f"  Loaded — {num_factors} factors, T={T}")
+    print(f"  Loaded — {num_factors} factors, T={T}, encoder={encoder_type}")
 
     print(f"\nSampling true latent variables (ground truth)...")
     true_z = dist.Bernoulli(
