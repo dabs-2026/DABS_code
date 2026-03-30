@@ -16,20 +16,39 @@ def _log_py_given_z_analytical(
     scale_active,
     scale_inactive,
     noise_scale,
+    interaction_pairs=None,
 ):
     num_outer, S, p = z_outer.shape
     T = y.shape[1]
 
-    X = torch.stack(xi_list, dim=1).float()
-
-    prior_var = torch.where(
+    X_main = torch.stack(xi_list, dim=1).float()
+    prior_var_main = torch.where(
         z_outer.bool(),
         torch.tensor(scale_active ** 2,   device=z_outer.device),
         torch.tensor(scale_inactive ** 2, device=z_outer.device),
     )
 
-    X_exp = X.unsqueeze(1)
-    Xv    = X_exp * prior_var.unsqueeze(2)
+    if interaction_pairs is not None and len(interaction_pairs) > 0:
+        i_idx = torch.tensor([i for i, j in interaction_pairs], device=z_outer.device)
+        j_idx = torch.tensor([j for i, j in interaction_pairs], device=z_outer.device)
+        X_interact = X_main[..., i_idx] * X_main[..., j_idx]
+        z_i = z_outer[..., i_idx]
+        z_j = z_outer[..., j_idx]
+        interact_active = z_i * z_j
+        prior_var_interact = torch.where(
+            interact_active.bool(),
+            torch.tensor(scale_active ** 2,   device=z_outer.device),
+            torch.tensor(scale_inactive ** 2, device=z_outer.device),
+        )
+
+        X_full        = torch.cat([X_main, X_interact], dim=-1)
+        prior_var_full = torch.cat([prior_var_main, prior_var_interact], dim=-1)
+    else:
+        X_full        = X_main
+        prior_var_full = prior_var_main
+
+    X_exp = X_full.unsqueeze(1)
+    Xv    = X_exp * prior_var_full.unsqueeze(2)
     K     = torch.matmul(Xv, X_exp.transpose(-1, -2))
     eye   = torch.eye(T, device=K.device).unsqueeze(0).unsqueeze(0)
     K     = K + noise_scale ** 2 * eye
@@ -48,7 +67,6 @@ def _log_py_given_z_analytical(
         log_p  = mvn.log_prob(y_flat)
 
     return log_p.reshape(num_outer, S)
-
 
 def _extract_y_and_xi(primary_trace, num_outer, T):
     y_list, xi_list = [], []
@@ -99,13 +117,17 @@ class MutualInformation(object):
 class PriorContrastiveEstimation(MutualInformation):
 
     def __init__(self, num_outer_samples=100, num_inner_samples=10,
-                 data_source=None,
-                 scale_active=1.0, scale_inactive=0.01, noise_scale=0.5):
+                data_source=None,
+                scale_active=1.0, scale_inactive=0.01, noise_scale=0.5,
+                diversity_penalty=0.1,
+                interaction_pairs=None):
         super().__init__(num_outer_samples, data_source=data_source)
-        self.num_inner_samples = num_inner_samples
-        self.scale_active      = scale_active
-        self.scale_inactive    = scale_inactive
-        self.noise_scale       = noise_scale
+        self.num_inner_samples  = num_inner_samples
+        self.scale_active       = scale_active
+        self.scale_inactive     = scale_inactive
+        self.noise_scale        = noise_scale
+        self.diversity_penalty  = diversity_penalty
+        self.interaction_pairs  = interaction_pairs
 
     def _analytical_log_prob(self, primary_trace, num_z_contrastive, p, T):
         y, xi_list = _extract_y_and_xi(primary_trace, self.num_outer_samples, T)
@@ -114,6 +136,7 @@ class PriorContrastiveEstimation(MutualInformation):
         log_py_z_pos = _log_py_given_z_analytical(
             y, xi_list, z_pos_exp,
             self.scale_active, self.scale_inactive, self.noise_scale,
+            interaction_pairs=self.interaction_pairs,
         ).squeeze(1)
 
         z_fn = primary_trace.nodes["z"]["fn"]
@@ -126,8 +149,8 @@ class PriorContrastiveEstimation(MutualInformation):
         log_py_z_con = _log_py_given_z_analytical(
             y, xi_list, z_con,
             self.scale_active, self.scale_inactive, self.noise_scale,
+            interaction_pairs=self.interaction_pairs,
         )
-
         return log_py_z_pos, log_py_z_con
 
     def differentiable_loss(self, model, *args, **kwargs):
@@ -145,6 +168,21 @@ class PriorContrastiveEstimation(MutualInformation):
         ).logsumexp(1) 
 
         loss = (log_py_combined - log_py_z_pos).mean(0)
+        design_sites = [
+            name for name in primary_trace.nodes
+            if primary_trace.nodes[name].get("subtype") == "design_sample"
+        ]
+        if len(design_sites) > 1 and self.diversity_penalty > 0.0:
+            designs = torch.stack([
+                primary_trace.nodes[name]["value"].float()
+                for name in design_sites
+            ], dim=0)
+            d1 = designs[:-1]
+            d2 = designs[1:]
+            similarity = (d1 * d2).sum(-1) / (
+                d1.norm(dim=-1) * d2.norm(dim=-1) + 1e-8
+            )
+            loss = loss + self.diversity_penalty * similarity.mean()
         warn_if_nan(loss, "loss")
         return loss
 
@@ -171,64 +209,3 @@ class NestedMonteCarloEstimation(PriorContrastiveEstimation):
     def loss(self, model, *args, **kwargs):
         loss_val = torch_item(self.differentiable_loss(model, *args, **kwargs))
         return loss_val - math.log(self.num_inner_samples)
-
-class PriorContrastiveEstimationScoreGradient(PriorContrastiveEstimation):
-    def __init__(self, num_outer_samples, num_inner_samples,
-                scale_active=1.0, scale_inactive=0.01, noise_scale=0.5,
-                diversity_penalty=0.1):
-        super().__init__(
-            num_outer_samples=num_outer_samples,
-            num_inner_samples=num_inner_samples,
-            scale_active=scale_active,
-            scale_inactive=scale_inactive,
-            noise_scale=noise_scale,
-        )
-        self.diversity_penalty = diversity_penalty
-
-    def differentiable_loss(self, model, *args, **kwargs):
-        primary_trace = self.get_primary_rollout(model, args, kwargs)
-        T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
-        p = primary_trace.nodes["z"]["value"].shape[-1]
-
-        log_py_z_pos, log_py_z_con = self._analytical_log_prob(
-            primary_trace, self.num_inner_samples, p, T
-        )
-
-        log_py_z_pos_exp = log_py_z_pos.unsqueeze(1)
-        log_py_combined  = torch.cat(
-            [log_py_z_pos_exp, log_py_z_con], dim=1
-        ).logsumexp(1)
-
-        with torch.no_grad():
-            g_no_grad = log_py_z_pos - log_py_combined
-
-        design_log_probs = sum(
-            node["log_prob"]
-            for node in primary_trace.nodes.values()
-            if node.get("subtype") == "design_sample"
-        )
-
-        loss = -(g_no_grad * design_log_probs - log_py_combined).mean(0)
-
-        design_sites = [
-            name for name in primary_trace.nodes
-            if primary_trace.nodes[name].get("subtype") == "design_sample"
-        ]
-        if len(design_sites) > 1:
-            designs = torch.stack([
-                primary_trace.nodes[name]["value"].float()
-                for name in design_sites
-            ], dim=0)
-            d1 = designs[:-1]
-            d2 = designs[1:]
-            similarity = (d1 * d2).sum(-1) / (
-                d1.norm(dim=-1) * d2.norm(dim=-1) + 1e-8
-            )
-            loss = loss + self.diversity_penalty * similarity.mean()
-
-        warn_if_nan(loss, "loss")
-        return loss
-
-    def loss(self, model, *args, **kwargs):
-        loss_val = torch_item(self.differentiable_loss(model, *args, **kwargs))
-        return loss_val - math.log(self.num_inner_samples + 1)

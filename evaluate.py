@@ -39,6 +39,9 @@ def gibbs_sampler(
     num_samples=2000,
     burnin=500,
 ):
+    use_pi_hyperprior = screening_model.use_pi_hyperprior
+    pi_beta_a = screening_model.pi_beta_a
+    pi_beta_b = screening_model.pi_beta_b
     p = screening_model.num_factors
     interaction_pairs = screening_model.interaction_pairs
     num_interactions = len(interaction_pairs)
@@ -150,7 +153,13 @@ def gibbs_sampler(
 
         for k in range(p):
             z[k] = sample_zk_given_rest(z, k)
-
+        if use_pi_hyperprior:
+            a_post = pi_beta_a + z.sum().item()
+            b_post = pi_beta_b + p - z.sum().item()
+            pi = dist.Beta(
+                torch.tensor(a_post),
+                torch.tensor(b_post)
+            ).sample().item()      
         if step >= burnin:
             z_samples.append(z.clone())
             theta_samples.append(theta.clone())
@@ -298,6 +307,10 @@ def evaluate(
     hidden_dim    = saved_params.get("hidden_dim",    hidden_dim)
     noise_scale   = saved_params.get("noise_scale",   noise_scale)
     encoder_type  = saved_params.get("encoder_type",  "original")
+    scale_active   = saved_params.get("scale_active",   scale_active)
+    scale_inactive = saved_params.get("scale_inactive", scale_inactive)
+    pi_beta_a = saved_params.get("pi_beta_a", 0.0)
+    pi_beta_b = saved_params.get("pi_beta_b", 0.0)
     expected_active_proportion = saved_params.get(
         "expected_active_proportion", expected_active_proportion
     )
@@ -313,6 +326,8 @@ def evaluate(
         num_factors=num_factors,
         T=T,
         expected_active_proportion=expected_active_proportion,
+        pi_beta_a=pi_beta_a,
+        pi_beta_b=pi_beta_b,
         scale_active=scale_active,
         scale_inactive=scale_inactive,
         noise_scale=noise_scale,

@@ -106,6 +106,7 @@ class SetEquivariantDesignNetwork(nn.Module):
         self.encoder      = encoder_network
         self.emitter      = emission_network
         self.encoder_type = encoder_type
+        self.tau = 1.0
         self.register_buffer("prototype", empty_value.clone())
         self.register_parameter("empty_value", nn.Parameter(empty_value))
 
@@ -136,11 +137,15 @@ class SetEquivariantDesignNetwork(nn.Module):
 
     def lazy(self, *design_obs_pairs):
         logits = self.forward(*design_obs_pairs)
-        logits_2class = torch.stack([-logits, logits], dim=-1)
-        soft = torch.nn.functional.gumbel_softmax(
-            logits_2class, tau=0.1, hard=True, dim=-1
-        )
-        xi = soft[..., 1] * 2 - 1
+        if self.training:
+            logits_2class = torch.stack([-logits, logits], dim=-1)
+            soft = torch.nn.functional.gumbel_softmax(
+                logits_2class, tau=self.tau, hard=True, dim=-1
+            )
+            xi = soft[..., 1] * 2 - 1
+        else:
+            xi = torch.sign(logits)
+            xi = torch.where(xi == 0, torch.ones_like(xi), xi)
         return pyro.distributions.Delta(xi, event_dim=1)
 
 class BatchDesignBaseline(SetEquivariantDesignNetwork):

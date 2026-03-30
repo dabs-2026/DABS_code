@@ -10,7 +10,7 @@ from pyro.infer.util import torch_item
 from tqdm import trange
 
 from oed.design import OED
-from bound import PriorContrastiveEstimation, PriorContrastiveEstimationScoreGradient
+from bound import PriorContrastiveEstimation
 from modules import (
     build_screening_network,
     BatchDesignBaseline,
@@ -42,6 +42,9 @@ def single_run(
     pi_beta_b=0.0,
     diversity_penalty=0.1,
     encoder_type="original",
+    tau_start=1.0,
+    tau_end=0.1,
+    tau_anneal_frac=0.5,
 ):
     if adam_betas_wd is None:
         adam_betas_wd = [0.9, 0.999, 0]
@@ -104,13 +107,20 @@ def single_run(
         }
     )
 
-    pce_loss = PriorContrastiveEstimationScoreGradient(
+    interaction_pairs = [
+        (i, j)
+        for i in range(num_factors)
+        for j in range(i + 1, num_factors)
+    ]
+
+    pce_loss = PriorContrastiveEstimation(
         num_outer_samples,
         num_inner_samples,
         scale_active=scale_active,
         scale_inactive=scale_inactive,
         noise_scale=noise_scale,
         diversity_penalty=diversity_penalty,
+        interaction_pairs=interaction_pairs,
     )
 
     oed = OED(screening_model.model, scheduler, pce_loss)
@@ -141,6 +151,9 @@ def single_run(
         "adam_beta2": adam_betas[1],
         "adam_weight_decay": adam_weight_decay,
         "diversity_penalty": diversity_penalty,
+        "tau_start": tau_start,
+        "tau_end": tau_end,
+        "tau_anneal_frac": tau_anneal_frac,
     }
 
     print("\n" + "=" * 55)
@@ -158,6 +171,12 @@ def single_run(
 
         num_steps_range = trange(0, num_steps, desc="Loss: 0.000 ")
         for i in num_steps_range:
+            if design_network_type == "dad" and num_steps > 0:
+                anneal_steps = max(1, int(num_steps * tau_anneal_frac))
+                frac = min(i / anneal_steps, 1.0)
+                tau = tau_start * (tau_end / tau_start) ** frac
+                design_net.tau = tau
+
             loss = oed.step()
             loss = torch_item(loss)
             loss_history.append(loss)
@@ -234,7 +253,12 @@ if __name__ == "__main__":
     parser.add_argument("--encoder-type", default="original", type=str,
                         choices=["original", "suff"],
                         help="original = MLP sum pooling, suff = sufficient stats")
-
+    parser.add_argument("--tau-start", default=1.0, type=float,
+                        help="Initial Gumbel-Softmax temperature")
+    parser.add_argument("--tau-end", default=0.1, type=float,
+                        help="Final Gumbel-Softmax temperature")
+    parser.add_argument("--tau-anneal-frac", default=0.5, type=float,
+                        help="Fraction of training steps over which to anneal tau")
     parser.add_argument("--device", default="cpu", type=str)
     parser.add_argument("--output-dir", default="results", type=str)
 
@@ -263,4 +287,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         adam_betas_wd=args.adam_betas_wd,
         diversity_penalty=args.diversity_penalty,
+        tau_start=args.tau_start,
+        tau_end=args.tau_end,
+        tau_anneal_frac=args.tau_anneal_frac,
     )
