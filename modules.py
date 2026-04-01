@@ -89,10 +89,10 @@ class ScreeningEmitter(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(encoding_dim, hidden_dim),
             nn.Softplus(),
-            nn.Dropout(p=0.5),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Softplus(),
-            nn.Dropout(p=0.5),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, num_factors),
         )
 
@@ -151,6 +151,7 @@ class SetEquivariantDesignNetwork(nn.Module):
 class BatchDesignBaseline(SetEquivariantDesignNetwork):
     def __init__(self, T, design_dim):
         nn.Module.__init__(self)
+        self.tau = 1.0
         self.register_buffer("prototype", torch.zeros(design_dim))
         self.designs = nn.ParameterList(
             [nn.Parameter(torch.randn(design_dim)) for _ in range(T)]
@@ -166,6 +167,7 @@ class BatchDesignBaseline(SetEquivariantDesignNetwork):
 class RandomDesignBaseline(SetEquivariantDesignNetwork):
     def __init__(self, design_dim):
         nn.Module.__init__(self)
+        self.tau = 1.0
         self.register_buffer("prototype", torch.zeros(design_dim))
         self.design_dim = design_dim
 

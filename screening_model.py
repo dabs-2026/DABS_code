@@ -19,6 +19,8 @@ class ScreeningExperiment(nn.Module):
         scale_active=1.0,
         scale_inactive=0.01,
         noise_scale=0.5,
+        sigma2_alpha0=3.0,
+        sigma2_beta0=None,
     ):
         super().__init__()
         self.design_net = design_net
@@ -30,7 +32,14 @@ class ScreeningExperiment(nn.Module):
         self.use_pi_hyperprior = (pi_beta_a > 0.0 and pi_beta_b > 0.0)
         self.scale_active = scale_active
         self.scale_inactive = scale_inactive
-        self.register_buffer('noise_scale', torch.tensor(noise_scale))
+
+        self.sigma2_alpha0 = sigma2_alpha0
+        if sigma2_beta0 is None:
+            sigma2_beta0 = (sigma2_alpha0 + 1.0) * (noise_scale ** 2)
+        self.sigma2_beta0 = sigma2_beta0
+
+        nominal_noise_scale = (sigma2_beta0 / (sigma2_alpha0 + 1.0)) ** 0.5
+        self.register_buffer('noise_scale', torch.tensor(nominal_noise_scale))
 
         self.interaction_pairs = [
             (i, j)
@@ -39,21 +48,35 @@ class ScreeningExperiment(nn.Module):
         ]
         self.num_interactions = len(self.interaction_pairs)
 
+    def _device(self):
+        return self.noise_scale.device
+
     def _sample_pi(self):
         if self.use_pi_hyperprior:
             pi = latent_sample(
                 "pi",
                 dist.Beta(
-                    torch.tensor(self.pi_beta_a, device=self.noise_scale.device),
-                    torch.tensor(self.pi_beta_b, device=self.noise_scale.device),
+                    torch.tensor(self.pi_beta_a, device=self._device()),
+                    torch.tensor(self.pi_beta_b, device=self._device()),
                 )
             )
         else:
             pi = self.pi_fixed
         return pi
 
-    def _sample_theta(self, pi):
-        device = self.noise_scale.device
+    def _sample_sigma2(self):
+        device = self._device()
+        concentration = torch.tensor(self.sigma2_alpha0, device=device)
+        rate = torch.tensor(1.0 / self.sigma2_beta0, device=device)
+        gamma_sample = latent_sample(
+            "sigma2_inv",
+            dist.Gamma(concentration, rate),
+        )
+        sigma2 = 1.0 / gamma_sample.clamp(min=1e-8)
+        return sigma2
+
+    def _sample_theta(self, pi, sigma2):
+        device = self._device()
         pi_vec = (
             pi.unsqueeze(-1).expand(*pi.shape, self.num_factors)
             if isinstance(pi, torch.Tensor) and pi.dim() > 0
@@ -120,7 +143,11 @@ class ScreeningExperiment(nn.Module):
             pyro.module("design_net", self.design_net)
 
         pi = self._sample_pi()
-        z, theta_main, theta_interact = self._sample_theta(pi)
+
+        sigma2 = self._sample_sigma2()
+        sigma = sigma2.sqrt()
+
+        z, theta_main, theta_interact = self._sample_theta(pi, sigma2)
 
         y_outcomes = []
         xi_designs = []
@@ -133,7 +160,7 @@ class ScreeningExperiment(nn.Module):
             mean_y = self._forward_map(xi, theta_main, theta_interact)
             y = observation_sample(
                 f"y{t + 1}",
-                dist.Normal(mean_y, self.noise_scale)
+                dist.Normal(mean_y, sigma)
             )
             y_outcomes.append(y)
             xi_designs.append(xi.detach())
@@ -182,10 +209,14 @@ class ScreeningExperiment(nn.Module):
                 true_theta_main = trace.nodes["theta_main"]["value"].cpu()
                 active_factors = true_z.nonzero(as_tuple=True)[0].tolist()
 
+                sigma2_inv_val = trace.nodes["sigma2_inv"]["value"].cpu()
+                sigma2_val = (1.0 / sigma2_inv_val.clamp(min=1e-8)).item()
+
                 if verbose:
                     if self.use_pi_hyperprior:
                         pi_val = trace.nodes["pi"]["value"].cpu().item()
                         print(f"  Sampled pi:     {pi_val:.3f}")
+                    print(f"  Sampled sigma^2:{sigma2_val:.4f}  (sigma={sigma2_val**0.5:.4f})")
                     print(f"  Active factors: {active_factors}")
                     print(f"  theta_main:     {true_theta_main.round(decimals=2)}")
 
@@ -205,6 +236,7 @@ class ScreeningExperiment(nn.Module):
                     "z": true_z,
                     "theta_main": true_theta_main,
                     "active_factors": active_factors,
+                    "sigma2": sigma2_val,
                     "designs": torch.stack(run_designs),
                     "observations": run_observations,
                 })

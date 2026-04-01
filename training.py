@@ -45,6 +45,8 @@ def single_run(
     tau_start=1.0,
     tau_end=0.1,
     tau_anneal_frac=0.5,
+    sigma2_alpha0=3.0,
+    sigma2_beta0=None,
 ):
     if adam_betas_wd is None:
         adam_betas_wd = [0.9, 0.999, 0]
@@ -93,7 +95,11 @@ def single_run(
         scale_active=scale_active,
         scale_inactive=scale_inactive,
         noise_scale=noise_scale,
+        sigma2_alpha0=sigma2_alpha0,
+        sigma2_beta0=sigma2_beta0,
     )
+
+    resolved_sigma2_beta0 = screening_model.sigma2_beta0
 
     scheduler = pyro.optim.ExponentialLR(
         {
@@ -119,13 +125,15 @@ def single_run(
         scale_active=scale_active,
         scale_inactive=scale_inactive,
         noise_scale=noise_scale,
+        sigma2_alpha0=sigma2_alpha0,
+        sigma2_beta0=resolved_sigma2_beta0,
         diversity_penalty=diversity_penalty,
         interaction_pairs=interaction_pairs,
     )
 
     oed = OED(screening_model.model, scheduler, pce_loss)
     os.makedirs(output_dir, exist_ok=True)
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id   = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(output_dir, f"loss_history_{run_id}.csv")
 
     params = {
@@ -133,6 +141,8 @@ def single_run(
         "num_factors": num_factors,
         "T": T,
         "noise_scale": noise_scale,
+        "sigma2_alpha0": sigma2_alpha0,
+        "sigma2_beta0": resolved_sigma2_beta0,
         "expected_active_proportion": expected_active_proportion,
         "pi_beta_a": pi_beta_a,
         "pi_beta_b": pi_beta_b,
@@ -173,8 +183,8 @@ def single_run(
         for i in num_steps_range:
             if design_network_type == "dad" and num_steps > 0:
                 anneal_steps = max(1, int(num_steps * tau_anneal_frac))
-                frac = min(i / anneal_steps, 1.0)
-                tau = tau_start * (tau_end / tau_start) ** frac
+                frac         = min(i / anneal_steps, 1.0)
+                tau          = tau_start * (tau_end / tau_start) ** frac
                 design_net.tau = tau
 
             loss = oed.step()
@@ -223,44 +233,44 @@ if __name__ == "__main__":
         description="DAD Screening Experiment Training"
     )
 
-    parser.add_argument("--seed", default=-1, type=int)
-
-    parser.add_argument("--num-factors", default=20, type=int)
-    parser.add_argument("--num-experiments", default=10, type=int)
-    parser.add_argument("--noise-scale", default=0.5, type=float)
-    parser.add_argument("--expected-active", default=0.2, type=float)
-    parser.add_argument("--pi-beta-a", default=0.0, type=float,
+    parser.add_argument("--seed",               default=-1,     type=int)
+    parser.add_argument("--num-factors",         default=20,     type=int)
+    parser.add_argument("--num-experiments",     default=10,     type=int)
+    parser.add_argument("--noise-scale",         default=0.5,    type=float,
+                        help="Sets the prior mode of sigma; used to derive sigma2_beta0")
+    parser.add_argument("--sigma2-alpha0",       default=3.0,    type=float,
+                        help="InvGamma shape for sigma^2 prior (must be > 1)")
+    parser.add_argument("--sigma2-beta0",        default=None,   type=float,
+                        help="InvGamma rate for sigma^2 prior "
+                             "(default: (alpha0+1)*noise_scale^2)")
+    parser.add_argument("--expected-active",     default=0.2,    type=float)
+    parser.add_argument("--pi-beta-a",           default=0.0,    type=float,
                         help="Beta hyperprior shape a for pi (0 = fixed pi)")
-    parser.add_argument("--pi-beta-b", default=0.0, type=float,
+    parser.add_argument("--pi-beta-b",           default=0.0,    type=float,
                         help="Beta hyperprior shape b for pi (0 = fixed pi)")
-    parser.add_argument("--scale-active", default=1.0, type=float)
-    parser.add_argument("--scale-inactive", default=0.01, type=float)
+    parser.add_argument("--scale-active",        default=1.0,    type=float)
+    parser.add_argument("--scale-inactive",      default=0.01,   type=float)
 
-    parser.add_argument("--hidden-dim", default=64, type=int)
-    parser.add_argument("--encoding-dim", default=16, type=int)
-    parser.add_argument("--design-network-type", default="dad", type=str,
+    parser.add_argument("--hidden-dim",          default=64,     type=int)
+    parser.add_argument("--encoding-dim",        default=16,     type=int)
+    parser.add_argument("--design-network-type", default="dad",  type=str,
                         choices=["dad", "static", "random"])
 
-    parser.add_argument("--num-steps", default=5000, type=int)
-    parser.add_argument("--num-inner-samples", default=100, type=int)
-    parser.add_argument("--num-outer-samples", default=200, type=int)
-    parser.add_argument("--lr", default=0.0001, type=float)
-    parser.add_argument("--gamma", default=0.95, type=float)
-    parser.add_argument("--adam-betas-wd", nargs="+", type=float,
+    parser.add_argument("--num-steps",           default=5000,   type=int)
+    parser.add_argument("--num-inner-samples",   default=100,    type=int)
+    parser.add_argument("--num-outer-samples",   default=200,    type=int)
+    parser.add_argument("--lr",                  default=0.0001, type=float)
+    parser.add_argument("--gamma",               default=0.95,   type=float)
+    parser.add_argument("--adam-betas-wd",       nargs="+",      type=float,
                         default=[0.9, 0.999, 0])
-    parser.add_argument("--diversity-penalty", default=0.1, type=float,
-                        help="Weight of the diversity penalty in REINFORCE loss")
-    parser.add_argument("--encoder-type", default="original", type=str,
-                        choices=["original", "suff"],
-                        help="original = MLP sum pooling, suff = sufficient stats")
-    parser.add_argument("--tau-start", default=1.0, type=float,
-                        help="Initial Gumbel-Softmax temperature")
-    parser.add_argument("--tau-end", default=0.1, type=float,
-                        help="Final Gumbel-Softmax temperature")
-    parser.add_argument("--tau-anneal-frac", default=0.5, type=float,
-                        help="Fraction of training steps over which to anneal tau")
-    parser.add_argument("--device", default="cpu", type=str)
-    parser.add_argument("--output-dir", default="results", type=str)
+    parser.add_argument("--diversity-penalty",   default=0.1,    type=float)
+    parser.add_argument("--encoder-type",        default="original", type=str,
+                        choices=["original", "suff"])
+    parser.add_argument("--tau-start",           default=1.0,    type=float)
+    parser.add_argument("--tau-end",             default=0.1,    type=float)
+    parser.add_argument("--tau-anneal-frac",     default=0.5,    type=float)
+    parser.add_argument("--device",              default="cpu",  type=str)
+    parser.add_argument("--output-dir",          default="results", type=str)
 
     args = parser.parse_args()
 
@@ -274,6 +284,8 @@ if __name__ == "__main__":
         num_factors=args.num_factors,
         T=args.num_experiments,
         noise_scale=args.noise_scale,
+        sigma2_alpha0=args.sigma2_alpha0,
+        sigma2_beta0=args.sigma2_beta0,
         expected_active_proportion=args.expected_active,
         pi_beta_a=args.pi_beta_a,
         pi_beta_b=args.pi_beta_b,

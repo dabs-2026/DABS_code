@@ -9,19 +9,21 @@ from pyro.util import warn_if_nan
 from pyro.infer.util import torch_item
 from pyro.contrib.util import lexpand
 
-def _log_py_given_z_analytical(
+def _log_py_given_z_student(
     y,
     xi_list,
     z_outer,
     scale_active,
     scale_inactive,
-    noise_scale,
+    sigma2_alpha0,
+    sigma2_beta0,
     interaction_pairs=None,
 ):
     num_outer, S, p = z_outer.shape
     T = y.shape[1]
 
     X_main = torch.stack(xi_list, dim=1).float()
+
     prior_var_main = torch.where(
         z_outer.bool(),
         torch.tensor(scale_active ** 2,   device=z_outer.device),
@@ -51,22 +53,45 @@ def _log_py_given_z_analytical(
     Xv    = X_exp * prior_var_full.unsqueeze(2)
     K     = torch.matmul(Xv, X_exp.transpose(-1, -2))
     eye   = torch.eye(T, device=K.device).unsqueeze(0).unsqueeze(0)
-    K     = K + noise_scale ** 2 * eye
+    K     = K + eye
+    scale_factor = sigma2_beta0 / sigma2_alpha0
+    Sigma = scale_factor * K
+
+    nu = 2.0 * sigma2_alpha0
+    d  = float(T)
+
+    Sigma_flat = Sigma.reshape(num_outer * S, T, T)
+    jitter = 1e-6 * torch.eye(T, device=Sigma_flat.device).unsqueeze(0)
+    try:
+        L = torch.linalg.cholesky(Sigma_flat + jitter)
+    except Exception:
+        L = torch.linalg.cholesky(
+            Sigma_flat + 1e-4 * torch.eye(T, device=Sigma_flat.device).unsqueeze(0)
+        )
+
+    log_det_Sigma = 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(-1)
 
     y_exp  = y.unsqueeze(1).expand(num_outer, S, T)
-    K_flat = K.reshape(num_outer * S, T, T)
     y_flat = y_exp.reshape(num_outer * S, T)
-    zeros  = torch.zeros(num_outer * S, T, device=y.device)
 
-    try:
-        mvn   = torch.distributions.MultivariateNormal(zeros, covariance_matrix=K_flat)
-        log_p = mvn.log_prob(y_flat)
-    except Exception:
-        K_flat = K_flat + 1e-6 * torch.eye(T, device=K_flat.device).unsqueeze(0)
-        mvn    = torch.distributions.MultivariateNormal(zeros, covariance_matrix=K_flat)
-        log_p  = mvn.log_prob(y_flat)
+    alpha = torch.linalg.solve_triangular(
+        L, y_flat.unsqueeze(-1), upper=False
+    ).squeeze(-1)
+    quad = (alpha * alpha).sum(-1)
+
+    log_norm = (
+        torch.lgamma(torch.tensor((nu + d) / 2.0))
+        - torch.lgamma(torch.tensor(nu / 2.0))
+        - (d / 2.0) * math.log(nu * math.pi)
+    )
+    log_p = (
+        log_norm
+        - 0.5 * log_det_Sigma
+        - ((nu + d) / 2.0) * torch.log1p(quad / nu)
+    )
 
     return log_p.reshape(num_outer, S)
+
 
 def _extract_y_and_xi(primary_trace, num_outer, T):
     y_list, xi_list = [], []
@@ -115,59 +140,78 @@ class MutualInformation(object):
         return trace
 
 class PriorContrastiveEstimation(MutualInformation):
-
-    def __init__(self, num_outer_samples=100, num_inner_samples=10,
-                data_source=None,
-                scale_active=1.0, scale_inactive=0.01, noise_scale=0.5,
-                diversity_penalty=0.1,
-                interaction_pairs=None):
+    def __init__(
+        self,
+        num_outer_samples=100,
+        num_inner_samples=10,
+        data_source=None,
+        scale_active=1.0,
+        scale_inactive=0.01,
+        sigma2_alpha0=3.0,
+        sigma2_beta0=None,
+        noise_scale=0.5,
+        diversity_penalty=0.1,
+        interaction_pairs=None,
+    ):
         super().__init__(num_outer_samples, data_source=data_source)
-        self.num_inner_samples  = num_inner_samples
-        self.scale_active       = scale_active
-        self.scale_inactive     = scale_inactive
-        self.noise_scale        = noise_scale
-        self.diversity_penalty  = diversity_penalty
-        self.interaction_pairs  = interaction_pairs
+        self.num_inner_samples = num_inner_samples
+        self.scale_active      = scale_active
+        self.scale_inactive    = scale_inactive
+        self.diversity_penalty = diversity_penalty
+        self.interaction_pairs = interaction_pairs
 
-    def _analytical_log_prob(self, primary_trace, num_z_contrastive, p, T):
+        self.sigma2_alpha0 = sigma2_alpha0
+        if sigma2_beta0 is None:
+            sigma2_beta0 = (sigma2_alpha0 + 1.0) * (noise_scale ** 2)
+        self.sigma2_beta0 = sigma2_beta0
+
+    def _student_log_prob(self, primary_trace, num_z_contrastive, p, T):
         y, xi_list = _extract_y_and_xi(primary_trace, self.num_outer_samples, T)
-        z_pos        = primary_trace.nodes["z"]["value"].float()
-        z_pos_exp    = z_pos.unsqueeze(1)
-        log_py_z_pos = _log_py_given_z_analytical(
+
+        z_pos     = primary_trace.nodes["z"]["value"].float()
+        z_pos_exp = z_pos.unsqueeze(1)
+
+        log_py_z_pos = _log_py_given_z_student(
             y, xi_list, z_pos_exp,
-            self.scale_active, self.scale_inactive, self.noise_scale,
+            self.scale_active, self.scale_inactive,
+            self.sigma2_alpha0, self.sigma2_beta0,
             interaction_pairs=self.interaction_pairs,
         ).squeeze(1)
-
         z_fn = primary_trace.nodes["z"]["fn"]
         pi   = (z_fn.base_dist.probs
                 if hasattr(z_fn, "base_dist")
                 else z_fn.probs)
+
         z_con = torch.bernoulli(
             pi.unsqueeze(1).expand(-1, num_z_contrastive, -1)
         )
-        log_py_z_con = _log_py_given_z_analytical(
+
+        log_py_z_con = _log_py_given_z_student(
             y, xi_list, z_con,
-            self.scale_active, self.scale_inactive, self.noise_scale,
+            self.scale_active, self.scale_inactive,
+            self.sigma2_alpha0, self.sigma2_beta0,
             interaction_pairs=self.interaction_pairs,
         )
+
         return log_py_z_pos, log_py_z_con
+
 
     def differentiable_loss(self, model, *args, **kwargs):
         primary_trace = self.get_primary_rollout(model, args, kwargs)
         T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
         p = primary_trace.nodes["z"]["value"].shape[-1]
 
-        log_py_z_pos, log_py_z_con = self._analytical_log_prob(
+        log_py_z_pos, log_py_z_con = self._student_log_prob(
             primary_trace, self.num_inner_samples, p, T
         )
 
         log_py_z_pos_exp = log_py_z_pos.unsqueeze(1)
         log_py_combined  = torch.cat(
             [log_py_z_pos_exp, log_py_z_con], dim=1
-        ).logsumexp(1) 
+        ).logsumexp(1)
 
         loss = (log_py_combined - log_py_z_pos).mean(0)
+
         design_sites = [
             name for name in primary_trace.nodes
             if primary_trace.nodes[name].get("subtype") == "design_sample"
@@ -176,13 +220,15 @@ class PriorContrastiveEstimation(MutualInformation):
             designs = torch.stack([
                 primary_trace.nodes[name]["value"].float()
                 for name in design_sites
-            ], dim=0)
-            d1 = designs[:-1]
-            d2 = designs[1:]
-            similarity = (d1 * d2).sum(-1) / (
-                d1.norm(dim=-1) * d2.norm(dim=-1) + 1e-8
-            )
-            loss = loss + self.diversity_penalty * similarity.mean()
+            ])
+            flat = designs.reshape(designs.shape[0], -1)
+            norms = torch.norm(flat, dim=1, keepdim=True) + 1e-8
+            sim_matrix = torch.matmul(flat, flat.t()) / (norms * norms.t())
+
+            mask = ~torch.eye(sim_matrix.shape[0], dtype=torch.bool, device=sim_matrix.device)
+            avg_sim = sim_matrix[mask].mean()
+
+            loss = loss + self.diversity_penalty * avg_sim
         warn_if_nan(loss, "loss")
         return loss
 
@@ -191,13 +237,12 @@ class PriorContrastiveEstimation(MutualInformation):
         return loss_val - math.log(self.num_inner_samples + 1)
 
 class NestedMonteCarloEstimation(PriorContrastiveEstimation):
-
     def differentiable_loss(self, model, *args, **kwargs):
         primary_trace = self.get_primary_rollout(model, args, kwargs)
         T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
         p = primary_trace.nodes["z"]["value"].shape[-1]
 
-        log_py_z_pos, log_py_z_con = self._analytical_log_prob(
+        log_py_z_pos, log_py_z_con = self._student_log_prob(
             primary_trace, self.num_inner_samples, p, T
         )
 
