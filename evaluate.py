@@ -31,7 +31,6 @@ def build_design_matrix(designs, interaction_pairs):
 def _student_log_marginal(y, X, z, interaction_pairs,
                            scale_active, scale_inactive,
                            alpha0, beta0):
-
     T, n_params = X.shape
     p = len(z)
 
@@ -81,6 +80,7 @@ def _student_log_marginal(y, X, z, interaction_pairs,
     log_p = log_norm - 0.5 * log_det - ((nu + d) / 2.0) * torch.log1p(quad / nu)
     return log_p
 
+
 def gibbs_sampler(
     designs,
     observations,
@@ -101,9 +101,9 @@ def gibbs_sampler(
     alpha0 = screening_model.sigma2_alpha0
     beta0  = screening_model.sigma2_beta0
 
-    T         = len(designs)
-    X         = build_design_matrix(designs, interaction_pairs)
-    y         = observations
+    T          = len(designs)
+    X          = build_design_matrix(designs, interaction_pairs)
+    y          = observations
     num_params = p + num_interactions
 
     def sample_theta_given_z_sigma2(z, sigma2):
@@ -139,38 +139,15 @@ def gibbs_sampler(
             post_cov  = torch.cholesky_inverse(L)
 
         post_mean = post_cov @ X.T @ y / sigma2
-        theta = dist.MultivariateNormal(
-            post_mean, sigma2 * post_cov
-        ).sample()
-        return theta
+        theta = dist.MultivariateNormal(post_mean, post_cov).sample()
+        return theta, post_mean, post_cov
 
-    def sample_sigma2_given_z_theta(z, theta):
-        scale_main = torch.where(
-            z.bool(),
-            torch.tensor(scale_active),
-            torch.tensor(scale_inactive)
-        )
-        if num_interactions > 0:
-            interact_active = torch.stack([
-                z[i] * z[j] for i, j in interaction_pairs
-            ], dim=-1)
-            scale_interact = torch.where(
-                interact_active.bool(),
-                torch.tensor(scale_active),
-                torch.tensor(scale_inactive)
-            )
-            prior_std = torch.cat([scale_main, scale_interact])
-        else:
-            prior_std = scale_main
-
-        prior_var = prior_std ** 2
-
-        residual   = y - X @ theta
-        rss        = (residual * residual).sum()
-        prior_quad = (theta * theta / prior_var).sum()
+    def sample_sigma2_given_z_theta(z, theta, post_mean, post_cov):
+        residual = y - X @ theta
+        rss      = (residual * residual).sum()
 
         alpha_n = alpha0 + T / 2.0
-        beta_n  = beta0 + 0.5 * rss + 0.5 * prior_quad
+        beta_n  = beta0  + 0.5 * rss
 
         gamma_sample = dist.Gamma(
             torch.tensor(alpha_n),
@@ -196,19 +173,20 @@ def gibbs_sampler(
         prob_active = torch.exp(log_p1 - log_total).clamp(0.0, 1.0)
         return torch.bernoulli(prob_active)
 
-    sigma2_init = beta0 / (alpha0 + 1.0)
+    sigma2_init = beta0 / (alpha0 - 1.0) if alpha0 > 1.0 else beta0 / alpha0
     sigma2 = torch.tensor(sigma2_init)
 
     z = dist.Bernoulli(pi * torch.ones(p)).sample()
 
-    z_samples     = []
-    theta_samples = []
+    z_samples      = []
+    theta_samples  = []
     sigma2_samples = []
 
     total_steps = burnin + num_samples
     print(f"\n  Running Gibbs sampler ({burnin} burnin + {num_samples} samples)...")
     print(f"  NIG prior: alpha0={alpha0:.2f}, beta0={beta0:.4f}  "
           f"(prior mode sigma={sigma2_init**0.5:.4f})")
+    print(f"  [FIX] sigma2 update uses RSS only (fixed-variance spike-and-slab)")
 
     for step in range(total_steps):
         if step % 200 == 0:
@@ -216,9 +194,9 @@ def gibbs_sampler(
             print(f"    Step {step:>4}/{total_steps}  "
                   f"active={active}  sigma={sigma2.item()**0.5:.4f}")
 
-        theta = sample_theta_given_z_sigma2(z, sigma2)
+        theta, post_mean, post_cov = sample_theta_given_z_sigma2(z, sigma2)
 
-        sigma2 = sample_sigma2_given_z_theta(z, theta)
+        sigma2 = sample_sigma2_given_z_theta(z, theta, post_mean, post_cov)
 
         for k in range(p):
             z[k] = sample_zk_given_rest(z, k, pi if not use_pi_hyperprior else pi)
@@ -299,12 +277,15 @@ def report_results(true_z, true_theta_main, z_samples, theta_samples,
     recall    = len(true_pos) / max(len(true_set), 1)
     f1        = 2 * precision * recall / max(precision + recall, 1e-8)
 
-    print(f"\nSummary:")
-    print(f"  True active:      {sorted(true_active)}")
-    print(f"  Predicted active: {sorted(predicted_active)}")
-    print(f"  True positives:   {sorted(true_pos)}")
-    print(f"  False positives:  {sorted(false_pos)}")
-    print(f"  False negatives:  {sorted(false_neg)}")
+    def to1(idx_set):
+        return sorted(i + 1 for i in idx_set)
+
+    print(f"\nSummary (factor numbers are 1-based):")
+    print(f"  True active:      {to1(true_set)}")
+    print(f"  Predicted active: {to1(pred_set)}")
+    print(f"  True positives:   {to1(true_pos)}")
+    print(f"  False positives:  {to1(false_pos)}")
+    print(f"  False negatives:  {to1(false_neg)}")
     print(f"\nMetrics:")
     print(f"  Precision: {precision:.2f}")
     print(f"  Recall:    {recall:.2f}")
@@ -328,7 +309,7 @@ def report_results(true_z, true_theta_main, z_samples, theta_samples,
         sig_f1        = 2 * sig_precision * sig_recall / max(sig_precision + sig_recall, 1e-8)
 
         print(f"\nPractical Metrics (|θ| > {delta}):")
-        print(f"  Significant active factors: {[k+1 for k in sorted(significant_active)]}")
+        print(f"  Significant active factors: {to1(set(significant_active))}")
         print(f"  True effect sizes:          "
               f"{[round(true_theta_main[k].item(), 3) for k in sorted(significant_active)]}")
         print(f"  Precision: {sig_precision:.2f}")
@@ -450,18 +431,14 @@ def evaluate(
         torch.zeros(screening_model.num_interactions), scale_interact
     ).sample()
 
-    true_sigma2 = dist.InverseGamma(
-        torch.tensor(sigma2_alpha0),
-        torch.tensor(sigma2_beta0)
-    ).sample() if hasattr(dist, "InverseGamma") else torch.tensor(
-        sigma2_beta0 / (sigma2_alpha0 - 1.0)
-    )
+    true_sigma2 = torch.tensor(sigma2_beta0 / (sigma2_alpha0 - 1.0)) if sigma2_alpha0 > 1 \
+        else torch.tensor(sigma2_beta0 / sigma2_alpha0)
 
     true_active = true_z.nonzero(as_tuple=True)[0].tolist()
-    print(f"  True active factors: {true_active}")
+    print(f"  True active factors (1-based): {[k+1 for k in true_active]}")
     print(f"  True effect sizes:   "
           f"{true_theta_main[true_z.bool()].round(decimals=2).tolist()}")
-    print(f"  True sigma:          {true_sigma2.item()**0.5:.4f}")
+    print(f"  True sigma (prior mean): {true_sigma2.item()**0.5:.4f}")
 
     print(f"\nRunning DAD policy for T={T} experiments...")
     with torch.no_grad():

@@ -78,10 +78,10 @@ def _log_py_given_z_student(
         L, y_flat.unsqueeze(-1), upper=False
     ).squeeze(-1)
     quad = (alpha * alpha).sum(-1)
-
+    dev = quad.device
     log_norm = (
-        torch.lgamma(torch.tensor((nu + d) / 2.0))
-        - torch.lgamma(torch.tensor(nu / 2.0))
+        torch.lgamma(torch.tensor((nu + d) / 2.0, device=dev))
+        - torch.lgamma(torch.tensor(nu / 2.0, device=dev))
         - (d / 2.0) * math.log(nu * math.pi)
     )
     log_p = (
@@ -198,6 +198,9 @@ class PriorContrastiveEstimation(MutualInformation):
 
     def differentiable_loss(self, model, *args, **kwargs):
         primary_trace = self.get_primary_rollout(model, args, kwargs)
+        xi1 = primary_trace.nodes["xi1"]["value"]
+        #print(f"xi1 requires_grad: {xi1.requires_grad}")
+
         T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
         p = primary_trace.nodes["z"]["value"].shape[-1]
 
@@ -212,20 +215,29 @@ class PriorContrastiveEstimation(MutualInformation):
 
         loss = (log_py_combined - log_py_z_pos).mean(0)
 
-        design_sites = [
-            name for name in primary_trace.nodes
-            if primary_trace.nodes[name].get("subtype") == "design_sample"
-        ]
+        # Identify design sites by NAME PREFIX (xi1, xi2, ...) rather than by
+        # the "subtype" msg field, which isn't always preserved by pyro's
+        # trace across versions. Using the name is guaranteed to work.
+        design_sites = sorted(
+            [name for name in primary_trace.nodes if name.startswith("xi")],
+            key=lambda s: int(s[2:]) if s[2:].isdigit() else 0,
+        )
         if len(design_sites) > 1 and self.diversity_penalty > 0.0:
             designs = torch.stack([
                 primary_trace.nodes[name]["value"].float()
                 for name in design_sites
             ])
-            flat = designs.reshape(designs.shape[0], -1)
+            # designs: [T, num_outer, p]  -- flatten rollouts into the design
+            # vector so the penalty measures similarity across time *within*
+            # a single rollout averaged over the batch.
+            T_d = designs.shape[0]
+            flat = designs.reshape(T_d, -1)
             norms = torch.norm(flat, dim=1, keepdim=True) + 1e-8
             sim_matrix = torch.matmul(flat, flat.t()) / (norms * norms.t())
 
-            mask = ~torch.eye(sim_matrix.shape[0], dtype=torch.bool, device=sim_matrix.device)
+            mask = ~torch.eye(
+                sim_matrix.shape[0], dtype=torch.bool, device=sim_matrix.device
+            )
             avg_sim = sim_matrix[mask].mean()
 
             loss = loss + self.diversity_penalty * avg_sim

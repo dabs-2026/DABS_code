@@ -65,9 +65,18 @@ class ScreeningExperiment(nn.Module):
         return pi
 
     def _sample_sigma2(self):
+        # We want sigma^2 ~ InvGamma(alpha=sigma2_alpha0, beta=sigma2_beta0).
+        # If X ~ Gamma(shape=alpha, rate=beta), then 1/X ~ InvGamma(alpha, beta).
+        # So we sample 1/sigma^2 ~ Gamma(alpha, rate=beta) -- note: rate=beta,
+        # NOT rate=1/beta. The previous code used rate=1/beta, which made
+        # sigma^2 ~ InvGamma(alpha, 1/beta), i.e. HUGE noise (mode ~ 6 when
+        # the user expected ~0.01). That miscalibration made the PCE loss
+        # operate on a noise level ~30x larger than bound.py was scoring
+        # against, which is why every policy (including the static batch
+        # baseline) plateaued at EIG bound ~ 0.
         device = self._device()
         concentration = torch.tensor(self.sigma2_alpha0, device=device)
-        rate = torch.tensor(1.0 / self.sigma2_beta0, device=device)
+        rate = torch.tensor(self.sigma2_beta0, device=device)
         gamma_sample = latent_sample(
             "sigma2_inv",
             dist.Gamma(concentration, rate),
@@ -222,13 +231,38 @@ class ScreeningExperiment(nn.Module):
 
                 run_designs = []
                 run_observations = []
-
+                has_encoder = hasattr(self.design_net, "encoder")
+                try:
+                    device = next(self.design_net.parameters()).device
+                except StopIteration:
+                    device = torch.device("cpu")
                 for t in range(self.T):
                     xi = trace.nodes[f"xi{t + 1}"]["value"].cpu()
                     y = trace.nodes[f"y{t + 1}"]["value"].cpu().item()
                     run_designs.append(xi)
                     run_observations.append(y)
 
+                    past_pairs = list(zip(
+                        [trace.nodes[f"xi{s+1}"]["value"].to(device) for s in range(t)],
+                        [trace.nodes[f"y{s+1}"]["value"].to(device)  for s in range(t)],
+                    ))
+                    if t > 0 and has_encoder:
+                        enc_list = [
+                            self.design_net.encoder(xi=d, y=o, t=[s+1])
+                            for s, (d, o) in enumerate(past_pairs)
+                        ]
+                        enc = torch.stack(enc_list).sum(0)
+                        print(f"    [enc t={t}] mean={enc.mean().item():.4f}  "
+                            f"std={enc.std().item():.4f}  "
+                            f"norm={enc.norm().item():.4f}")
+                        for s, (d, o) in enumerate(past_pairs):
+                            enc_single = self.design_net.encoder(xi=d, y=o, t=[s+1])
+                            enc_zero   = self.design_net.encoder(xi=d, y=torch.zeros(1, device=device), t=[s+1])
+                            o_val = o.item() if isinstance(o, torch.Tensor) else float(o)
+                            print(f"      step {s}: y={o_val:.3f}  "
+                                  f"enc_norm={enc_single.norm().item():.4f}  "
+                                  f"enc_zero_norm={enc_zero.norm().item():.4f}  "
+                                  f"diff={( enc_single - enc_zero).norm().item():.4f}")
                     if verbose:
                         print(f"  xi{t + 1}: {xi.int().tolist()}  y{t + 1}: {y:.3f}")
 

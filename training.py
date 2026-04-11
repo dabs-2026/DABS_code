@@ -18,7 +18,6 @@ from modules import (
 )
 from screening_model import ScreeningExperiment
 
-
 def single_run(
     seed,
     num_steps,
@@ -52,6 +51,18 @@ def single_run(
         adam_betas_wd = [0.9, 0.999, 0]
 
     pyro.clear_param_store()
+    device = torch.device(device)
+    print("=" * 60)
+    print("DEVICE INFORMATION")
+    print("=" * 60)
+    print(f"Requested device          : {device}")
+    print(f"torch.cuda.is_available() : {torch.cuda.is_available()}")
+    print(f"Current device            : {device}")
+    print(f"Number of GPUs available  : {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"GPU name                  : {torch.cuda.get_device_name(0)}")
+        print(f"Current GPU memory used   : {torch.cuda.memory_allocated(0)/1024**2:.1f} MB")
+    print("=" * 60)
     if seed == -1:
         seed = torch.randint(0, 10000, (1,)).item()
     torch.manual_seed(seed)
@@ -98,7 +109,7 @@ def single_run(
         sigma2_alpha0=sigma2_alpha0,
         sigma2_beta0=sigma2_beta0,
     )
-
+    screening_model = screening_model.to(device)
     resolved_sigma2_beta0 = screening_model.sigma2_beta0
 
     scheduler = pyro.optim.ExponentialLR(
@@ -177,9 +188,10 @@ def single_run(
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["step", "train_loss", "eval_loss"])
+        writer.writerow(["step", "train_loss", "eval_loss", "eig_train", "eig_eval", "tau"])
 
         num_steps_range = trange(0, num_steps, desc="Loss: 0.000 ")
+        tau = tau_start  # ensure defined for static/random paths
         for i in num_steps_range:
             if design_network_type == "dad" and num_steps > 0:
                 anneal_steps = max(1, int(num_steps * tau_anneal_frac))
@@ -191,10 +203,17 @@ def single_run(
             loss = torch_item(loss)
             loss_history.append(loss)
 
-            if i % 50 == 0:
-                num_steps_range.set_description("Loss: {:.3f} ".format(loss))
-                loss_eval = oed.evaluate_loss()
-                writer.writerow([i, loss, loss_eval])
+            #if i % 50 == 0:
+            #num_steps_range.set_description("Loss: {:.3f} ".format(loss))
+            #loss_eval = oed.evaluate_loss()
+            #writer.writerow([i, loss, loss_eval])
+            if i % 10 == 0:
+                eig_train  = -loss      
+                loss_eval = oed.evaluate_loss()    
+                eig_eval   = -loss_eval     
+                num_steps_range.set_description("EIG: {:.3f} τ: {:.3f}".format(eig_eval, tau))
+                writer.writerow([i, loss, loss_eval, eig_train, eig_eval, tau])
+
 
             if i % 1000 == 0 and i > 0:
                 scheduler.step()
@@ -223,7 +242,8 @@ def single_run(
         model_path,
     )
     print(f"  Model saved to          : {model_path}")
-
+    print("\n--- Encoding diagnostic (3 example runs) ---")
+    screening_model.eval_policy(n_trace=3, verbose=True)
     return screening_model
 
 
