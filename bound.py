@@ -151,6 +151,8 @@ class PriorContrastiveEstimation(MutualInformation):
         sigma2_beta0=None,
         noise_scale=0.5,
         diversity_penalty=0.1,
+        logit_l2_penalty=0.01,
+        dense_rewards=False,
         interaction_pairs=None,
     ):
         super().__init__(num_outer_samples, data_source=data_source)
@@ -158,6 +160,8 @@ class PriorContrastiveEstimation(MutualInformation):
         self.scale_active      = scale_active
         self.scale_inactive    = scale_inactive
         self.diversity_penalty = diversity_penalty
+        self.logit_l2_penalty  = logit_l2_penalty
+        self.dense_rewards     = dense_rewards
         self.interaction_pairs = interaction_pairs
 
         self.sigma2_alpha0 = sigma2_alpha0
@@ -165,55 +169,127 @@ class PriorContrastiveEstimation(MutualInformation):
             sigma2_beta0 = (sigma2_alpha0 + 1.0) * (noise_scale ** 2)
         self.sigma2_beta0 = sigma2_beta0
 
-    def _student_log_prob(self, primary_trace, num_z_contrastive, p, T):
-        y, xi_list = _extract_y_and_xi(primary_trace, self.num_outer_samples, T)
-
-        z_pos     = primary_trace.nodes["z"]["value"].float()
+    def _get_z_and_contrastive(self, primary_trace, num_z_contrastive):
+        """Extract z_pos, z_con, and the contrastive samples (shared across steps)."""
+        z_pos = primary_trace.nodes["z"]["value"].float()
         z_pos_exp = z_pos.unsqueeze(1)
 
-        log_py_z_pos = _log_py_given_z_student(
-            y, xi_list, z_pos_exp,
-            self.scale_active, self.scale_inactive,
-            self.sigma2_alpha0, self.sigma2_beta0,
-            interaction_pairs=self.interaction_pairs,
-        ).squeeze(1)
         z_fn = primary_trace.nodes["z"]["fn"]
-        pi   = (z_fn.base_dist.probs
-                if hasattr(z_fn, "base_dist")
-                else z_fn.probs)
+        pi = (z_fn.base_dist.probs
+              if hasattr(z_fn, "base_dist")
+              else z_fn.probs)
 
         z_con = torch.bernoulli(
             pi.unsqueeze(1).expand(-1, num_z_contrastive, -1)
         )
+        return z_pos_exp, z_con
+
+    def _student_log_prob_prefix(self, y_prefix, xi_prefix, z_pos_exp, z_con):
+        """Compute Student-t log prob for a trajectory prefix."""
+        log_py_z_pos = _log_py_given_z_student(
+            y_prefix, xi_prefix, z_pos_exp,
+            self.scale_active, self.scale_inactive,
+            self.sigma2_alpha0, self.sigma2_beta0,
+            interaction_pairs=self.interaction_pairs,
+        ).squeeze(1)
 
         log_py_z_con = _log_py_given_z_student(
-            y, xi_list, z_con,
+            y_prefix, xi_prefix, z_con,
             self.scale_active, self.scale_inactive,
             self.sigma2_alpha0, self.sigma2_beta0,
             interaction_pairs=self.interaction_pairs,
         )
-
         return log_py_z_pos, log_py_z_con
+
+    def _student_log_prob(self, primary_trace, num_z_contrastive, p, T):
+        y, xi_list = _extract_y_and_xi(primary_trace, self.num_outer_samples, T)
+        z_pos_exp, z_con = self._get_z_and_contrastive(primary_trace, num_z_contrastive)
+        return self._student_log_prob_prefix(y, xi_list, z_pos_exp, z_con)
 
 
     def differentiable_loss(self, model, *args, **kwargs):
+        # Clear logits history before the rollout so we only collect
+        # logits from this forward pass.
+        design_net = None
+        for module in model.__self__.modules() if hasattr(model, '__self__') else []:
+            if hasattr(module, '_logits_history'):
+                module._logits_history = []
+                design_net = module
+                break
+        # Fallback: walk the model if the above didn't find it
+        if design_net is None:
+            try:
+                m = model.__self__ if hasattr(model, '__self__') else model
+                if hasattr(m, 'design_net') and hasattr(m.design_net, '_logits_history'):
+                    m.design_net._logits_history = []
+                    design_net = m.design_net
+            except Exception:
+                pass
+
         primary_trace = self.get_primary_rollout(model, args, kwargs)
-        xi1 = primary_trace.nodes["xi1"]["value"]
-        #print(f"xi1 requires_grad: {xi1.requires_grad}")
 
         T = sum(1 for k in primary_trace.nodes if k.startswith("y"))
         p = primary_trace.nodes["z"]["value"].shape[-1]
 
-        log_py_z_pos, log_py_z_con = self._student_log_prob(
-            primary_trace, self.num_inner_samples, p, T
-        )
+        if not self.dense_rewards:
+            # ── Terminal loss (original) ──
+            log_py_z_pos, log_py_z_con = self._student_log_prob(
+                primary_trace, self.num_inner_samples, p, T
+            )
+            log_py_z_pos_exp = log_py_z_pos.unsqueeze(1)
+            log_py_combined  = torch.cat(
+                [log_py_z_pos_exp, log_py_z_con], dim=1
+            ).logsumexp(1)
+            loss = (log_py_combined - log_py_z_pos).mean(0)
 
-        log_py_z_pos_exp = log_py_z_pos.unsqueeze(1)
-        log_py_combined  = torch.cat(
-            [log_py_z_pos_exp, log_py_z_con], dim=1
-        ).logsumexp(1)
+        else:
+            # ── Dense step-by-step loss ──
+            # Compute sPCE at each prefix h_1, h_2, ..., h_T.
+            # loss = Σ_t [sPCE(h_t) - sPCE(h_{t-1})]
+            # This telescopes to sPCE(h_T), giving the same total value,
+            # but each step gets a direct gradient signal through only
+            # one Gumbel-STE discretization instead of T chained ones.
+            y_full, xi_full = _extract_y_and_xi(
+                primary_trace, self.num_outer_samples, T
+            )
+            z_pos_exp, z_con = self._get_z_and_contrastive(
+                primary_trace, self.num_inner_samples
+            )
+            # z tensors are sampled from the prior — no design gradients
+            # flow through them. Detach to save memory.
+            z_pos_exp = z_pos_exp.detach()
+            z_con = z_con.detach()
 
-        loss = (log_py_combined - log_py_z_pos).mean(0)
+            loss = torch.tensor(0.0, device=y_full.device)
+            prev_spce = torch.zeros(
+                self.num_outer_samples, device=y_full.device
+            )
+
+            for t in range(1, T + 1):
+                # Prefix: y_1:t and xi_1:t
+                y_prefix = y_full[..., :t]          # [num_outer, t]
+                xi_prefix = xi_full[:t]             # list of t tensors
+
+                log_pos, log_con = self._student_log_prob_prefix(
+                    y_prefix, xi_prefix, z_pos_exp, z_con
+                )
+
+                log_pos_exp = log_pos.unsqueeze(1)
+                log_combined = torch.cat(
+                    [log_pos_exp, log_con], dim=1
+                ).logsumexp(1)
+
+                spce_t = log_combined - log_pos     # [num_outer]
+
+                # Per-step increment: sPCE(h_t) - sPCE(h_{t-1})
+                # Each increment is a separate term in the loss, giving
+                # autograd a direct gradient path to step t's design.
+                loss = loss + (spce_t - prev_spce).mean(0)
+                prev_spce = spce_t.detach()  # detach so gradients don't
+                                             # flow backward through
+                                             # previous steps' sPCE terms
+
+            # loss now equals sPCE(h_T) numerically, but with richer gradients
 
         # Identify design sites by NAME PREFIX (xi1, xi2, ...) rather than by
         # the "subtype" msg field, which isn't always preserved by pyro's
@@ -241,6 +317,17 @@ class PriorContrastiveEstimation(MutualInformation):
             avg_sim = sim_matrix[mask].mean()
 
             loss = loss + self.diversity_penalty * avg_sim
+
+        # Logit L2 penalty: prevents logit saturation so that
+        # straight-through gradients remain alive. Without this,
+        # logits can grow unbounded, making the Gumbel noise
+        # irrelevant and killing adaptivity in some seeds.
+        if self.logit_l2_penalty > 0.0 and design_net is not None:
+            logits_list = getattr(design_net, '_logits_history', [])
+            if logits_list:
+                all_logits = torch.cat([l.reshape(-1) for l in logits_list])
+                loss = loss + self.logit_l2_penalty * all_logits.pow(2).mean()
+
         warn_if_nan(loss, "loss")
         return loss
 

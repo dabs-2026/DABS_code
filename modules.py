@@ -167,6 +167,170 @@ class SufficientStatEncoder(nn.Module):
         stats = torch.cat([XtX_tri, Xty, yty], dim=-1)                          # [..., stat_dim]
         return self.projection(stats)
 
+class CanonicalEncoder(nn.Module):
+    """
+    Signed-permutation-equivariant encoder via canonicalization.
+
+    Implements the approach from Strouwen (2026): for each factor i, build a
+    per-factor feature vector from its row in X'X and its entry in X'y,
+    canonicalize the sign convention, sort neighbors by magnitude, then
+    process with a weight-shared MLP.  The result is exactly equivariant to
+    any signed permutation of the factors.
+
+    This replaces both the encoder AND the emitter — the forward() method
+    returns logits [batch, p] directly.
+
+    Feature vector per factor i (dimension = 3*p + 2):
+      For each neighbor j: (|X'y_j|/t, |X'X_{ij}|/t, sign_product)
+      sorted in descending lexicographic order, then:
+      yty/t, t/T
+    """
+
+    def __init__(self, num_factors, hidden_dim=64, T_max=20):
+        super().__init__()
+        self.num_factors = num_factors
+        self.T_max = T_max
+        self.encoding_dim = hidden_dim  # needed by SetEquivariantDesignNetwork
+
+        feature_dim = 3 * num_factors + 2  # per-factor feature size
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, 1),
+        )
+        # Zero-init final layer bias
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def _descending_lexicographic_order(self, *keys):
+        """Stable descending lexicographic sort along the last axis."""
+        order = torch.argsort(-keys[-1], dim=-1, stable=True)
+        for key in reversed(keys[:-1]):
+            key_sorted = torch.gather(key, -1, order)
+            key_order = torch.argsort(-key_sorted, dim=-1, stable=True)
+            order = torch.gather(order, -1, key_order)
+        return order
+
+    def _lexicographic_compare(self, lhs, rhs):
+        """Compare flattened sequences lexicographically."""
+        diff = lhs - rhs
+        neq = diff != 0
+        any_neq = neq.any(dim=-1)
+        first_idx = neq.float().argmax(dim=-1)
+        first_diff = torch.gather(diff, -1, first_idx.unsqueeze(-1)).squeeze(-1)
+        return torch.where(any_neq, torch.where(first_diff > 0, 1.0, -1.0), 0.0)
+
+    def canonicalize(self, XtX, Xty, t):
+        """
+        Build canonical per-factor features and local sign orientations.
+
+        Args:
+            XtX: [..., p, p] normalized X'X
+            Xty: [..., p]    normalized X'y
+            t:   scalar      current step count
+
+        Returns:
+            canonical: [..., p, 3*p]  canonical feature block per factor
+            orientation: [..., p]     +1 or -1 sign per factor
+        """
+        p = self.num_factors
+        t_safe = max(t, 1.0)
+        xty_norm = Xty / t_safe           # [..., p]
+        xtx_norm = XtX / t_safe           # [..., p, p]
+
+        # For each factor i, the neighbor features are indexed by j:
+        #   |X'y_j|, |X'X_{ij}|, X'y_j * X'X_{ij}
+        # xty_neighbors: [..., p, p] — row i has X'y_j for all j
+        xty_neighbors = xty_norm.unsqueeze(-2).expand_as(xtx_norm)
+        abs_xty = xty_neighbors.abs()
+        abs_xtx = xtx_norm.abs()
+        signed_products = xty_neighbors * xtx_norm
+
+        # Sort neighbors for + and - orientations
+        order_plus = self._descending_lexicographic_order(
+            abs_xty, abs_xtx, signed_products
+        )
+        order_minus = self._descending_lexicographic_order(
+            abs_xty, abs_xtx, -signed_products
+        )
+
+        def serialize(order, signed_vals):
+            sorted_abs_xty = torch.gather(abs_xty, -1, order)
+            sorted_abs_xtx = torch.gather(abs_xtx, -1, order)
+            sorted_signed = torch.gather(signed_vals, -1, order)
+            # Stack into [..., p, p, 3] then flatten to [..., p, 3*p]
+            triple = torch.stack([sorted_abs_xty, sorted_abs_xtx, sorted_signed], dim=-1)
+            return triple.reshape(*triple.shape[:-2], 3 * p)
+
+        features_plus = serialize(order_plus, signed_products)
+        features_minus = serialize(order_minus, -signed_products)
+
+        # Pick canonical orientation per factor
+        orientation = self._lexicographic_compare(
+            features_plus, features_minus
+        ).to(XtX.dtype)
+
+        canonical = torch.where(
+            (orientation >= 0).unsqueeze(-1),
+            features_plus,
+            features_minus,
+        )
+        return canonical, orientation
+
+    def forward(self, *design_obs_pairs):
+        """
+        Build sufficient stats from history, canonicalize, run MLP.
+
+        Returns: logits [..., p]
+        """
+        if len(design_obs_pairs) == 0:
+            return None
+
+        xi_list, y_list = zip(*design_obs_pairs)
+        xi = torch.stack(xi_list, dim=-2).float()   # [..., T, p]
+        T = xi.shape[-2]
+
+        y_raw = []
+        for y_s in y_list:
+            if isinstance(y_s, torch.Tensor):
+                y_raw.append(y_s.float().squeeze(-1))
+            else:
+                y_raw.append(
+                    torch.full(xi.shape[:-2], float(y_s),
+                               dtype=xi.dtype, device=xi.device)
+                )
+        y = torch.stack(y_raw, dim=-1)               # [..., T]
+
+        # Sufficient statistics (main effects only — interactions are
+        # determined by main-effect activity via heredity)
+        XtX = torch.matmul(xi.transpose(-1, -2), xi)           # [..., p, p]
+        Xty = torch.matmul(
+            xi.transpose(-1, -2), y.unsqueeze(-1)
+        ).squeeze(-1)                                            # [..., p]
+        yty = (y * y).sum(-1, keepdim=True)                     # [..., 1]
+
+        # Canonicalize
+        canonical, orientation = self.canonicalize(XtX, Xty, float(T))
+
+        # Append global features: yty/t and t/T_max
+        t_safe = max(float(T), 1.0)
+        p = self.num_factors
+        yty_feat = (yty / t_safe).unsqueeze(-2).expand(
+            *yty.shape[:-1], p, 1
+        )                                                        # [..., p, 1]
+        t_feat = torch.full_like(yty_feat, float(T) / self.T_max)  # [..., p, 1]
+        features = torch.cat([canonical, yty_feat, t_feat], dim=-1)  # [..., p, 3p+2]
+
+        # Weight-shared MLP: same weights for every factor
+        logits_raw = self.mlp(features).squeeze(-1)              # [..., p]
+
+        # Undo sign canonicalization
+        logits = orientation * logits_raw
+
+        return logits
+
+
 class ScreeningEmitter(nn.Module):
     def __init__(self, encoding_dim, num_factors, hidden_dim=64):
         super().__init__()
@@ -194,6 +358,7 @@ class SetEquivariantDesignNetwork(nn.Module):
         self.emitter      = emission_network
         self.encoder_type = encoder_type
         self.tau = 1.0
+        self._has_static_floor = False  # set by load_static_floor()
         self.register_buffer("prototype", empty_value.clone())
         # The t=0 "initial context" is a learnable vector in encoding space,
         # NOT in design space. This is what lets the policy distinguish
@@ -209,10 +374,46 @@ class SetEquivariantDesignNetwork(nn.Module):
             nn.Parameter(torch.randn(enc_dim)),
         )
 
+    def load_static_floor(self, static_checkpoint_path):
+        """Load frozen static designs as a floor. DABS outputs
+        static_design[t] + adaptive_correction(history).
+        This guarantees DABS >= static by construction."""
+        ckpt = torch.load(static_checkpoint_path, map_location="cpu",
+                          weights_only=False)
+        state = ckpt["model_state_dict"]
+        # Extract the T static design vectors
+        designs = []
+        t = 0
+        while f"design_net.designs.{t}" in state:
+            designs.append(state[f"design_net.designs.{t}"].clone())
+            t += 1
+        if not designs:
+            raise ValueError(f"No static designs found in {static_checkpoint_path}")
+        # Register as frozen buffers (no gradients)
+        for i, d in enumerate(designs):
+            self.register_buffer(f"static_floor_{i}", d)
+        self._n_static = len(designs)
+        # Use a flag instead of storing the list as an attribute
+        # (PyTorch rejects plain lists as module attributes)
+        self._has_static_floor = True
+        print(f"Loaded static floor: {len(designs)} designs from {static_checkpoint_path}")
+
     def forward(self, *design_obs_pairs):
         t = len(design_obs_pairs)
 
-        if self.encoder_type == "original":
+        if self.encoder_type == "canonical":
+            if t == 0:
+                adaptive_logits = torch.zeros(self.encoder.num_factors,
+                                              device=self.prototype.device)
+            else:
+                adaptive_logits = self.encoder(*design_obs_pairs)
+            # Add static floor if loaded
+            if getattr(self, "_has_static_floor", False) and t < getattr(self, "_n_static", 0):
+                static_logits = getattr(self, f"static_floor_{t}").to(adaptive_logits.device)
+                return static_logits + adaptive_logits
+            return adaptive_logits
+
+        elif self.encoder_type == "original":
             if t == 0:
                 encoding = self.empty_value
             else:
@@ -228,10 +429,32 @@ class SetEquivariantDesignNetwork(nn.Module):
             else:
                 encoding = self.encoder(*design_obs_pairs)
 
-        return self.emitter(encoding)
+        adaptive_logits = self.emitter(encoding)
+
+        # Add static floor if loaded: logits = static + adaptive_correction
+        if getattr(self, "_has_static_floor", False) and t < getattr(self, "_n_static", 0):
+            static_logits = getattr(self, f"static_floor_{t}").to(adaptive_logits.device)
+            return static_logits + adaptive_logits
+        return adaptive_logits
 
     def lazy(self, *design_obs_pairs):
+        t = len(design_obs_pairs)
         logits = self.forward(*design_obs_pairs)
+
+        # Store raw logits for the L2 penalty in bound.py.
+        # When using the static floor, we only penalize the ADAPTIVE CORRECTION
+        # (logits - static_floor), not the total. This preserves the guarantee
+        # that DABS >= Static: at correction=0, the policy outputs the static
+        # design, and the L2 penalty doesn't push it away.
+        if not hasattr(self, "_logits_history"):
+            self._logits_history = []
+        if getattr(self, "_has_static_floor", False) and t < getattr(self, "_n_static", 0):
+            static_logits = getattr(self, f"static_floor_{t}").to(logits.device)
+            # Only penalize the deviation from static
+            self._logits_history.append(logits - static_logits)
+        else:
+            self._logits_history.append(logits)
+
         # Gumbel straight-through estimator for binary +/- 1 designs.
         #   Forward:  hard sample from Gumbel(logits), giving ±1
         #   Backward: gradient of soft gumbel_softmax with temperature tau
@@ -284,18 +507,36 @@ class RandomDesignBaseline(SetEquivariantDesignNetwork):
 
 def build_screening_network(
     num_factors, encoding_dim=32, hidden_dim=64,
-    encoder_type="original", proj_hidden=64,
+    encoder_type="original", proj_hidden=64, T_max=20,
 ):
+    if encoder_type == "canonical":
+        # Canonical encoder is self-contained (no separate emitter needed).
+        # It returns logits directly via its weight-shared per-factor MLP.
+        encoder = CanonicalEncoder(
+            num_factors=num_factors,
+            hidden_dim=hidden_dim,
+            T_max=T_max,
+        )
+        # Emitter is an identity pass-through since canonical encoder
+        # already outputs logits.
+        emitter = nn.Identity()
+        empty_value = torch.zeros(num_factors)
+        return SetEquivariantDesignNetwork(
+            encoder_network=encoder,
+            emission_network=emitter,
+            empty_value=empty_value,
+            encoder_type=encoder_type,
+        )
+
     if encoder_type == "original":
-        encoder      = ScreeningEncoder(
+        encoder = ScreeningEncoder(
             num_factors=num_factors,
             encoding_dim=encoding_dim,
             hidden_dim=hidden_dim,
         )
         emitter_input = encoding_dim
-
     else:
-        encoder      = SufficientStatEncoder(
+        encoder = SufficientStatEncoder(
             num_factors=num_factors,
             encoding_dim=encoding_dim,
             proj_hidden=proj_hidden,

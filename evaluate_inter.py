@@ -460,45 +460,262 @@ def evaluate(
 
     return precision, recall, f1
 
+def evaluate_multi_inter(
+    model_path,
+    num_rollouts=50,
+    num_gibbs_samples=200,
+    burnin=100,
+    threshold=0.5,
+    seed=42,
+):
+    """Multi-rollout evaluation with separate main effect and interaction metrics."""
+    import numpy as np
+    import io, sys as _sys
+
+    torch.manual_seed(seed)
+    pyro.set_rng_seed(seed)
+
+    checkpoint   = torch.load(model_path, map_location="cpu", weights_only=False)
+    saved_params = checkpoint.get("params", {})
+
+    num_factors    = saved_params.get("num_factors", 20)
+    T              = saved_params.get("T", 10)
+    encoding_dim   = saved_params.get("encoding_dim", 16)
+    hidden_dim     = saved_params.get("hidden_dim", 64)
+    noise_scale    = saved_params.get("noise_scale", 0.5)
+    sigma2_alpha0  = saved_params.get("sigma2_alpha0", 3.0)
+    sigma2_beta0   = saved_params.get("sigma2_beta0")
+    encoder_type   = saved_params.get("encoder_type", "original")
+    scale_active   = saved_params.get("scale_active", 1.0)
+    scale_inactive = saved_params.get("scale_inactive", 0.01)
+    pi_beta_a      = saved_params.get("pi_beta_a", 0.0)
+    pi_beta_b      = saved_params.get("pi_beta_b", 0.0)
+    expected_active = saved_params.get("expected_active_proportion", 0.2)
+    design_network_type = saved_params.get("design_network_type", "dad")
+
+    if sigma2_beta0 is None:
+        sigma2_beta0 = (sigma2_alpha0 + 1.0) * (noise_scale ** 2)
+
+    if design_network_type == "static":
+        from modules import BatchDesignBaseline
+        design_net = BatchDesignBaseline(T=T, design_dim=num_factors)
+    elif design_network_type == "random":
+        from modules import RandomDesignBaseline
+        design_net = RandomDesignBaseline(design_dim=num_factors)
+    else:
+        design_net = build_screening_network(
+            num_factors=num_factors,
+            encoding_dim=encoding_dim,
+            hidden_dim=hidden_dim,
+            encoder_type=encoder_type,
+        )
+
+    screening_model = ScreeningExperiment(
+        design_net=design_net,
+        num_factors=num_factors,
+        T=T,
+        expected_active_proportion=expected_active,
+        pi_beta_a=pi_beta_a,
+        pi_beta_b=pi_beta_b,
+        scale_active=scale_active,
+        scale_inactive=scale_inactive,
+        noise_scale=noise_scale,
+        sigma2_alpha0=sigma2_alpha0,
+        sigma2_beta0=sigma2_beta0,
+    )
+    # Register static_floor buffers if the checkpoint has them
+    sd = checkpoint["model_state_dict"]
+    floor_keys = [k for k in sd.keys() if "static_floor_" in k]
+    if floor_keys and design_network_type == "dad":
+        for k in floor_keys:
+            buf_name = k.replace("design_net.", "")
+            screening_model.design_net.register_buffer(buf_name, sd[k].clone())
+        screening_model.design_net._has_static_floor = True
+        screening_model.design_net._n_static = len(floor_keys)
+
+    screening_model.load_state_dict(sd, strict=False)
+    screening_model.eval()
+
+    interaction_pairs = screening_model.interaction_pairs
+    p = num_factors
+
+    print("=" * 64)
+    print("Multi-rollout Gibbs evaluation (main effects + interactions)")
+    print("=" * 64)
+    print(f"Checkpoint:    {model_path}")
+    print(f"Policy type:   {design_network_type}")
+    print(f"Encoder:       {encoder_type}")
+    print(f"Dims:          p={p}, T={T}, interactions={len(interaction_pairs)}")
+    print(f"Prior:         pi={expected_active}, noise={noise_scale}")
+    print(f"Rollouts:      {num_rollouts}")
+    print(f"Gibbs:         {num_gibbs_samples} samples + {burnin} burnin")
+    print("-" * 64)
+
+    # Main effect metrics
+    main_f1_list, main_tpr_list, main_fdr_list, main_exact_list = [], [], [], []
+    # Interaction metrics
+    inter_f1_list, inter_tpr_list, inter_fdr_list = [], [], []
+
+    for r in range(num_rollouts):
+        if r % 10 == 0:
+            print(f"  Rollout {r+1}/{num_rollouts}...")
+
+        # Sample ground truth
+        true_z = dist.Bernoulli(
+            expected_active * torch.ones(p)
+        ).sample()
+
+        scale_main = torch.where(
+            true_z.bool(), torch.tensor(scale_active), torch.tensor(scale_inactive)
+        )
+        true_theta_main = dist.Normal(torch.zeros(p), scale_main).sample()
+
+        interact_active = torch.stack([
+            true_z[i] * true_z[j] for i, j in interaction_pairs
+        ], dim=-1)
+        scale_interact = torch.where(
+            interact_active.bool(),
+            torch.tensor(scale_active), torch.tensor(scale_inactive)
+        )
+        true_theta_interact = dist.Normal(
+            torch.zeros(len(interaction_pairs)), scale_interact
+        ).sample()
+
+        # Run policy
+        with torch.no_grad():
+            designs, observations = run_policy(
+                screening_model, true_z, true_theta_main, true_theta_interact
+            )
+
+        # Gibbs sampler (quiet)
+        old_stdout = _sys.stdout
+        _sys.stdout = io.StringIO()
+        z_samples, theta_samples, sigma2_samples = gibbs_sampler(
+            designs, observations, screening_model,
+            num_samples=num_gibbs_samples,
+            burnin=burnin,
+        )
+        _sys.stdout = old_stdout
+
+        # --- Main effect metrics ---
+        activity_probs = z_samples.mean(0)
+        pred_main = activity_probs > threshold
+        true_main = true_z.bool()
+
+        tp = (pred_main & true_main).sum().item()
+        fp = (pred_main & ~true_main).sum().item()
+        fn = (~pred_main & true_main).sum().item()
+
+        main_tpr = tp / max(tp + fn, 1)
+        main_fdr = fp / max(tp + fp, 1)
+        if (tp + fp + fn) > 0:
+            prec = tp / max(tp + fp, 1)
+            rec = tp / max(tp + fn, 1)
+            main_f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+        else:
+            main_f1 = 1.0 if true_main.sum() == 0 else 0.0
+        main_exact = float(pred_main.equal(true_main))
+
+        main_f1_list.append(main_f1)
+        main_tpr_list.append(main_tpr)
+        main_fdr_list.append(main_fdr)
+        main_exact_list.append(main_exact)
+
+        # --- Interaction metrics ---
+        # Predicted interactions from predicted main effects (strong heredity)
+        pred_interact = torch.stack([
+            pred_main[i] & pred_main[j] for i, j in interaction_pairs
+        ])
+        true_interact = interact_active.bool()
+
+        itp = (pred_interact & true_interact).sum().item()
+        ifp = (pred_interact & ~true_interact).sum().item()
+        ifn = (~pred_interact & true_interact).sum().item()
+
+        inter_tpr_val = itp / max(itp + ifn, 1)
+        inter_fdr_val = ifp / max(itp + ifp, 1)
+        if (itp + ifp + ifn) > 0:
+            iprec = itp / max(itp + ifp, 1)
+            irec = itp / max(itp + ifn, 1)
+            inter_f1_val = 2 * iprec * irec / max(iprec + irec, 1e-8)
+        else:
+            inter_f1_val = 1.0 if true_interact.sum() == 0 else 0.0
+
+        inter_f1_list.append(inter_f1_val)
+        inter_tpr_list.append(inter_tpr_val)
+        inter_fdr_list.append(inter_fdr_val)
+
+    # Aggregate
+    def fmt(arr):
+        a = np.array(arr)
+        return f"{a.mean():.4f} +/- {a.std()/np.sqrt(len(a)):.4f}"
+
+    print()
+    print("Main Effects:")
+    print(f"  F1:          {fmt(main_f1_list)}")
+    print(f"  TPR:         {fmt(main_tpr_list)}")
+    print(f"  FDR:         {fmt(main_fdr_list)}")
+    print(f"  Exact Match: {fmt(main_exact_list)}")
+    print()
+    print("Interactions:")
+    print(f"  F1:          {fmt(inter_f1_list)}")
+    print(f"  TPR:         {fmt(inter_tpr_list)}")
+    print(f"  FDR:         {fmt(inter_fdr_list)}")
+    print()
+    print(f"Rollouts:      {num_rollouts}")
+    print("=" * 64)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Evaluate trained DAD screening policy with interactions"
     )
     parser.add_argument("--model-path",         required=True,  type=str)
-    parser.add_argument("--num-factors",         default=20,     type=int)
-    parser.add_argument("--num-experiments",     default=10,     type=int)
-    parser.add_argument("--expected-active",     default=0.2,    type=float)
-    parser.add_argument("--scale-active",        default=1.0,    type=float)
-    parser.add_argument("--scale-inactive",      default=0.01,   type=float)
-    parser.add_argument("--noise-scale",         default=0.5,    type=float,
-                        help="Used to set sigma2_beta0 = (alpha0+1)*noise_scale^2")
-    parser.add_argument("--sigma2-alpha0",       default=3.0,    type=float,
-                        help="InvGamma shape for sigma^2 prior")
-    parser.add_argument("--sigma2-beta0",        default=None,   type=float,
-                        help="InvGamma rate for sigma^2 prior (default: derived from noise-scale)")
-    parser.add_argument("--encoding-dim",        default=16,     type=int)
-    parser.add_argument("--hidden-dim",          default=64,     type=int)
-    parser.add_argument("--num-gibbs-samples",   default=2000,   type=int)
-    parser.add_argument("--burnin",              default=500,    type=int)
-    parser.add_argument("--threshold",           default=0.5,    type=float)
-    parser.add_argument("--seed",                default=-1,     type=int)
+    parser.add_argument("--num-rollouts",       default=1,      type=int,
+                        help="Use 1 for detailed single-run, 10+ for aggregated metrics")
+    parser.add_argument("--num-gibbs-samples",  default=2000,   type=int)
+    parser.add_argument("--burnin",             default=500,    type=int)
+    parser.add_argument("--threshold",          default=0.5,    type=float)
+    parser.add_argument("--seed",               default=42,     type=int)
+
+    # Legacy single-run args
+    parser.add_argument("--num-factors",        default=20,     type=int)
+    parser.add_argument("--num-experiments",    default=10,     type=int)
+    parser.add_argument("--expected-active",    default=0.2,    type=float)
+    parser.add_argument("--scale-active",       default=1.0,    type=float)
+    parser.add_argument("--scale-inactive",     default=0.01,   type=float)
+    parser.add_argument("--noise-scale",        default=0.5,    type=float)
+    parser.add_argument("--sigma2-alpha0",      default=3.0,    type=float)
+    parser.add_argument("--sigma2-beta0",       default=None,   type=float)
+    parser.add_argument("--encoding-dim",       default=16,     type=int)
+    parser.add_argument("--hidden-dim",         default=64,     type=int)
 
     args = parser.parse_args()
 
-    evaluate(
-        model_path=args.model_path,
-        num_factors=args.num_factors,
-        T=args.num_experiments,
-        expected_active_proportion=args.expected_active,
-        scale_active=args.scale_active,
-        scale_inactive=args.scale_inactive,
-        noise_scale=args.noise_scale,
-        sigma2_alpha0=args.sigma2_alpha0,
-        sigma2_beta0=args.sigma2_beta0,
-        encoding_dim=args.encoding_dim,
-        hidden_dim=args.hidden_dim,
-        num_gibbs_samples=args.num_gibbs_samples,
-        burnin=args.burnin,
-        threshold=args.threshold,
-        seed=args.seed,
-    )
+    if args.num_rollouts > 1:
+        evaluate_multi_inter(
+            model_path=args.model_path,
+            num_rollouts=args.num_rollouts,
+            num_gibbs_samples=args.num_gibbs_samples,
+            burnin=args.burnin,
+            threshold=args.threshold,
+            seed=args.seed,
+        )
+    else:
+        evaluate(
+            model_path=args.model_path,
+            num_factors=args.num_factors,
+            T=args.num_experiments,
+            expected_active_proportion=args.expected_active,
+            scale_active=args.scale_active,
+            scale_inactive=args.scale_inactive,
+            noise_scale=args.noise_scale,
+            sigma2_alpha0=args.sigma2_alpha0,
+            sigma2_beta0=args.sigma2_beta0,
+            encoding_dim=args.encoding_dim,
+            hidden_dim=args.hidden_dim,
+            num_gibbs_samples=args.num_gibbs_samples,
+            burnin=args.burnin,
+            threshold=args.threshold,
+            seed=args.seed,
+        )

@@ -46,6 +46,9 @@ def single_run(
     tau_anneal_frac=0.5,
     sigma2_alpha0=3.0,
     sigma2_beta0=None,
+    logit_l2_penalty=0.01,
+    dense_rewards=False,
+    static_checkpoint=None,
 ):
     if adam_betas_wd is None:
         adam_betas_wd = [0.9, 0.999, 0]
@@ -77,6 +80,11 @@ def single_run(
             hidden_dim=hidden_dim,
             encoder_type=encoder_type,
         ).to(device)
+
+        # Load static floor if provided — DABS outputs static + adaptive_correction
+        if static_checkpoint is not None:
+            design_net.load_static_floor(static_checkpoint)
+            print(f"  Static floor loaded from: {static_checkpoint}")
 
     elif design_network_type == "static":
         design_net = BatchDesignBaseline(
@@ -139,6 +147,8 @@ def single_run(
         sigma2_alpha0=sigma2_alpha0,
         sigma2_beta0=resolved_sigma2_beta0,
         diversity_penalty=diversity_penalty,
+        logit_l2_penalty=logit_l2_penalty,
+        dense_rewards=dense_rewards,
         interaction_pairs=interaction_pairs,
     )
 
@@ -172,6 +182,8 @@ def single_run(
         "adam_beta2": adam_betas[1],
         "adam_weight_decay": adam_weight_decay,
         "diversity_penalty": diversity_penalty,
+        "logit_l2_penalty": logit_l2_penalty,
+        "dense_rewards": dense_rewards,
         "tau_start": tau_start,
         "tau_end": tau_end,
         "tau_anneal_frac": tau_anneal_frac,
@@ -284,11 +296,18 @@ if __name__ == "__main__":
     parser.add_argument("--adam-betas-wd",       nargs="+",      type=float,
                         default=[0.9, 0.999, 0])
     parser.add_argument("--diversity-penalty",   default=0.1,    type=float)
+    parser.add_argument("--logit-l2-penalty",   default=0.01,   type=float,
+                        help="L2 penalty on raw logits to prevent saturation (default 0.01)")
+    parser.add_argument("--dense-rewards",      action="store_true",
+                        help="Use dense step-by-step sPCE loss instead of terminal-only")
     parser.add_argument("--encoder-type",        default="original", type=str,
-                        choices=["original", "suff"])
+                        choices=["original", "suff", "canonical"])
     parser.add_argument("--tau-start",           default=1.0,    type=float)
     parser.add_argument("--tau-end",             default=0.1,    type=float)
     parser.add_argument("--tau-anneal-frac",     default=0.5,    type=float)
+    parser.add_argument("--static-checkpoint",   default=None,   type=str,
+                        help="Path to a trained static checkpoint. DABS will output "
+                             "static_design + adaptive_correction (guarantees >= static)")
     parser.add_argument("--device",              default="cpu",  type=str)
     parser.add_argument("--output-dir",          default="results", type=str)
 
@@ -319,6 +338,9 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         adam_betas_wd=args.adam_betas_wd,
         diversity_penalty=args.diversity_penalty,
+        logit_l2_penalty=args.logit_l2_penalty,
+        dense_rewards=args.dense_rewards,
+        static_checkpoint=args.static_checkpoint,
         tau_start=args.tau_start,
         tau_end=args.tau_end,
         tau_anneal_frac=args.tau_anneal_frac,
