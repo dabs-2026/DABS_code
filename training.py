@@ -11,6 +11,7 @@ from tqdm import trange
 
 from oed.design import OED
 from bound import PriorContrastiveEstimation
+from bound_totalmi import PriorContrastiveEstimationTotalMI
 from modules import (
     build_screening_network,
     BatchDesignBaseline,
@@ -49,6 +50,11 @@ def single_run(
     logit_l2_penalty=0.01,
     dense_rewards=False,
     static_checkpoint=None,
+    warm_start_ckpt=None,
+    use_total_mi=False,
+    use_g_prior=False,
+    strong_heredity=False,
+    pi_interaction=0.5,
 ):
     if adam_betas_wd is None:
         adam_betas_wd = [0.9, 0.999, 0]
@@ -81,10 +87,13 @@ def single_run(
             encoder_type=encoder_type,
         ).to(device)
 
-        # Load static floor if provided — DABS outputs static + adaptive_correction
         if static_checkpoint is not None:
             design_net.load_static_floor(static_checkpoint)
             print(f"  Static floor loaded from: {static_checkpoint}")
+
+        if warm_start_ckpt is not None:
+            design_net.warm_start_from_static(warm_start_ckpt)
+            print(f"  Warm-start initialised from: {warm_start_ckpt}")
 
     elif design_network_type == "static":
         design_net = BatchDesignBaseline(
@@ -116,7 +125,14 @@ def single_run(
         noise_scale=noise_scale,
         sigma2_alpha0=sigma2_alpha0,
         sigma2_beta0=sigma2_beta0,
+        use_g_prior=use_g_prior,
+        strong_heredity=strong_heredity,
+        pi_interaction=pi_interaction,
     )
+    if use_g_prior:
+        print("[g-prior] ScreeningExperiment using beta | sigma^2 ~ N(0, sigma^2 * scale^2).")
+    if strong_heredity:
+        print(f"[strong-heredity] z_int ~ Bernoulli(pi_int * z_i * z_j), pi_int={pi_interaction}")
     screening_model = screening_model.to(device)
     resolved_sigma2_beta0 = screening_model.sigma2_beta0
 
@@ -138,7 +154,9 @@ def single_run(
         for j in range(i + 1, num_factors)
     ]
 
-    pce_loss = PriorContrastiveEstimation(
+    bound_cls = (PriorContrastiveEstimationTotalMI
+                 if use_total_mi else PriorContrastiveEstimation)
+    pce_loss = bound_cls(
         num_outer_samples,
         num_inner_samples,
         scale_active=scale_active,
@@ -150,7 +168,12 @@ def single_run(
         logit_l2_penalty=logit_l2_penalty,
         dense_rewards=dense_rewards,
         interaction_pairs=interaction_pairs,
+        strong_heredity=strong_heredity,
+        pi_interaction=pi_interaction,
     )
+    if use_total_mi:
+        print(f"[Total-MI] Using PriorContrastiveEstimationTotalMI "
+              f"(target I(theta; h_T), Gaussian likelihood).")
 
     oed = OED(screening_model.model, scheduler, pce_loss)
     os.makedirs(output_dir, exist_ok=True)
@@ -184,6 +207,10 @@ def single_run(
         "diversity_penalty": diversity_penalty,
         "logit_l2_penalty": logit_l2_penalty,
         "dense_rewards": dense_rewards,
+        "use_total_mi": use_total_mi,
+        "use_g_prior": use_g_prior,
+        "strong_heredity": strong_heredity,
+        "pi_interaction": pi_interaction,
         "tau_start": tau_start,
         "tau_end": tau_end,
         "tau_anneal_frac": tau_anneal_frac,
@@ -203,7 +230,7 @@ def single_run(
         writer.writerow(["step", "train_loss", "eval_loss", "eig_train", "eig_eval", "tau"])
 
         num_steps_range = trange(0, num_steps, desc="Loss: 0.000 ")
-        tau = tau_start  # ensure defined for static/random paths
+        tau = tau_start
         for i in num_steps_range:
             if design_network_type == "dad" and num_steps > 0:
                 anneal_steps = max(1, int(num_steps * tau_anneal_frac))
@@ -215,17 +242,12 @@ def single_run(
             loss = torch_item(loss)
             loss_history.append(loss)
 
-            #if i % 50 == 0:
-            #num_steps_range.set_description("Loss: {:.3f} ".format(loss))
-            #loss_eval = oed.evaluate_loss()
-            #writer.writerow([i, loss, loss_eval])
             if i % 10 == 0:
                 eig_train  = -loss      
                 loss_eval = oed.evaluate_loss()    
                 eig_eval   = -loss_eval     
                 num_steps_range.set_description("EIG: {:.3f} τ: {:.3f}".format(eig_eval, tau))
                 writer.writerow([i, loss, loss_eval, eig_train, eig_eval, tau])
-
 
             if i % 1000 == 0 and i > 0:
                 scheduler.step()
@@ -255,7 +277,10 @@ def single_run(
     )
     print(f"  Model saved to          : {model_path}")
     print("\n--- Encoding diagnostic (3 example runs) ---")
-    screening_model.eval_policy(n_trace=3, verbose=True)
+    try:
+        screening_model.eval_policy(n_trace=3, verbose=True)
+    except TypeError as _diag_err:
+        print(f"  (diagnostic skipped: {_diag_err})")
     return screening_model
 
 
@@ -268,18 +293,12 @@ if __name__ == "__main__":
     parser.add_argument("--seed",               default=-1,     type=int)
     parser.add_argument("--num-factors",         default=20,     type=int)
     parser.add_argument("--num-experiments",     default=10,     type=int)
-    parser.add_argument("--noise-scale",         default=0.5,    type=float,
-                        help="Sets the prior mode of sigma; used to derive sigma2_beta0")
-    parser.add_argument("--sigma2-alpha0",       default=3.0,    type=float,
-                        help="InvGamma shape for sigma^2 prior (must be > 1)")
-    parser.add_argument("--sigma2-beta0",        default=None,   type=float,
-                        help="InvGamma rate for sigma^2 prior "
-                             "(default: (alpha0+1)*noise_scale^2)")
+    parser.add_argument("--noise-scale",         default=0.5,    type=float)
+    parser.add_argument("--sigma2-alpha0",       default=3.0,    type=float)
+    parser.add_argument("--sigma2-beta0",        default=None,   type=float)
     parser.add_argument("--expected-active",     default=0.2,    type=float)
-    parser.add_argument("--pi-beta-a",           default=0.0,    type=float,
-                        help="Beta hyperprior shape a for pi (0 = fixed pi)")
-    parser.add_argument("--pi-beta-b",           default=0.0,    type=float,
-                        help="Beta hyperprior shape b for pi (0 = fixed pi)")
+    parser.add_argument("--pi-beta-a",           default=0.0,    type=float)
+    parser.add_argument("--pi-beta-b",           default=0.0,    type=float)
     parser.add_argument("--scale-active",        default=1.0,    type=float)
     parser.add_argument("--scale-inactive",      default=0.01,   type=float)
 
@@ -296,18 +315,23 @@ if __name__ == "__main__":
     parser.add_argument("--adam-betas-wd",       nargs="+",      type=float,
                         default=[0.9, 0.999, 0])
     parser.add_argument("--diversity-penalty",   default=0.1,    type=float)
-    parser.add_argument("--logit-l2-penalty",   default=0.01,   type=float,
-                        help="L2 penalty on raw logits to prevent saturation (default 0.01)")
-    parser.add_argument("--dense-rewards",      action="store_true",
-                        help="Use dense step-by-step sPCE loss instead of terminal-only")
+    parser.add_argument("--logit-l2-penalty",   default=0.01,   type=float)
+    parser.add_argument("--dense-rewards",      action="store_true")
     parser.add_argument("--encoder-type",        default="original", type=str,
                         choices=["original", "suff", "canonical"])
     parser.add_argument("--tau-start",           default=1.0,    type=float)
     parser.add_argument("--tau-end",             default=0.1,    type=float)
     parser.add_argument("--tau-anneal-frac",     default=0.5,    type=float)
-    parser.add_argument("--static-checkpoint",   default=None,   type=str,
-                        help="Path to a trained static checkpoint. DABS will output "
-                             "static_design + adaptive_correction (guarantees >= static)")
+    parser.add_argument("--static-checkpoint",   default=None,   type=str)
+    parser.add_argument("--warm-start-ckpt",     default=None,   type=str)
+    parser.add_argument("--use-total-mi",        action="store_true")
+    parser.add_argument("--use-g-prior",           action="store_true")
+    parser.add_argument("--strong-heredity",       action="store_true",
+                        help="Sample z_int ~ Bernoulli(pi_int * z_i * z_j) "
+                             "(non-deterministic interactions, true strong heredity).")
+    parser.add_argument("--pi-interaction",        default=0.5, type=float,
+                        help="Bernoulli prob for interaction activity within "
+                             "the heredity-allowed set (only used if --strong-heredity).")
     parser.add_argument("--device",              default="cpu",  type=str)
     parser.add_argument("--output-dir",          default="results", type=str)
 
@@ -341,7 +365,12 @@ if __name__ == "__main__":
         logit_l2_penalty=args.logit_l2_penalty,
         dense_rewards=args.dense_rewards,
         static_checkpoint=args.static_checkpoint,
+        warm_start_ckpt=args.warm_start_ckpt,
         tau_start=args.tau_start,
         tau_end=args.tau_end,
         tau_anneal_frac=args.tau_anneal_frac,
+        use_total_mi=args.use_total_mi,
+        use_g_prior=args.use_g_prior,
+        strong_heredity=args.strong_heredity,
+        pi_interaction=args.pi_interaction,
     )

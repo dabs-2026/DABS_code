@@ -21,6 +21,9 @@ class ScreeningExperiment(nn.Module):
         noise_scale=0.5,
         sigma2_alpha0=3.0,
         sigma2_beta0=None,
+        use_g_prior=False,
+        strong_heredity=False,
+        pi_interaction=0.5,
     ):
         super().__init__()
         self.design_net = design_net
@@ -32,6 +35,9 @@ class ScreeningExperiment(nn.Module):
         self.use_pi_hyperprior = (pi_beta_a > 0.0 and pi_beta_b > 0.0)
         self.scale_active = scale_active
         self.scale_inactive = scale_inactive
+        self.use_g_prior = use_g_prior
+        self.strong_heredity = strong_heredity
+        self.pi_interaction = pi_interaction
 
         self.sigma2_alpha0 = sigma2_alpha0
         if sigma2_beta0 is None:
@@ -47,6 +53,15 @@ class ScreeningExperiment(nn.Module):
             for j in range(i + 1, num_factors)
         ]
         self.num_interactions = len(self.interaction_pairs)
+
+        if self.num_interactions > 0:
+            ii = torch.tensor([i for i, _ in self.interaction_pairs])
+            jj = torch.tensor([j for _, j in self.interaction_pairs])
+        else:
+            ii = torch.zeros(0, dtype=torch.long)
+            jj = torch.zeros(0, dtype=torch.long)
+        self.register_buffer('_ii', ii)
+        self.register_buffer('_jj', jj)
 
     def _device(self):
         return self.noise_scale.device
@@ -65,15 +80,6 @@ class ScreeningExperiment(nn.Module):
         return pi
 
     def _sample_sigma2(self):
-        # We want sigma^2 ~ InvGamma(alpha=sigma2_alpha0, beta=sigma2_beta0).
-        # If X ~ Gamma(shape=alpha, rate=beta), then 1/X ~ InvGamma(alpha, beta).
-        # So we sample 1/sigma^2 ~ Gamma(alpha, rate=beta) -- note: rate=beta,
-        # NOT rate=1/beta. The previous code used rate=1/beta, which made
-        # sigma^2 ~ InvGamma(alpha, 1/beta), i.e. HUGE noise (mode ~ 6 when
-        # the user expected ~0.01). That miscalibration made the PCE loss
-        # operate on a noise level ~30x larger than bound.py was scoring
-        # against, which is why every policy (including the static batch
-        # baseline) plateaued at EIG bound ~ 0.
         device = self._device()
         concentration = torch.tensor(self.sigma2_alpha0, device=device)
         rate = torch.tensor(self.sigma2_beta0, device=device)
@@ -103,6 +109,12 @@ class ScreeningExperiment(nn.Module):
             torch.tensor(self.scale_active, device=device),
             torch.tensor(self.scale_inactive, device=device)
         )
+
+        if self.use_g_prior:
+            sigma = torch.sqrt(sigma2)
+            while sigma.dim() < scale_main.dim():
+                sigma = sigma.unsqueeze(-1)
+            scale_main = scale_main * sigma
         theta_main = latent_sample(
             "theta_main",
             dist.Normal(
@@ -111,16 +123,29 @@ class ScreeningExperiment(nn.Module):
             ).to_event(1)
         )
 
-        interact_active = torch.stack([
-            z[..., i] * z[..., j]
-            for i, j in self.interaction_pairs
-        ], dim=-1)
+        parent_active = z[..., self._ii] * z[..., self._jj]
+
+        if self.strong_heredity and self.num_interactions > 0:
+            pi_int_vec = self.pi_interaction * parent_active
+            z_interact = latent_sample(
+                "z_interact",
+                dist.Bernoulli(pi_int_vec).to_event(1),
+                infer={"subtype": "target"},
+            )
+            interact_active = z_interact
+        else:
+            interact_active = parent_active
 
         scale_interact = torch.where(
             interact_active.bool(),
             torch.tensor(self.scale_active, device=device),
             torch.tensor(self.scale_inactive, device=device)
         )
+        if self.use_g_prior:
+            sigma = torch.sqrt(sigma2)
+            while sigma.dim() < scale_interact.dim():
+                sigma = sigma.unsqueeze(-1)
+            scale_interact = scale_interact * sigma
         theta_interact = latent_sample(
             "theta_interact",
             dist.Normal(
@@ -152,7 +177,6 @@ class ScreeningExperiment(nn.Module):
             pyro.module("design_net", self.design_net)
 
         pi = self._sample_pi()
-
         sigma2 = self._sample_sigma2()
         sigma = sigma2.sqrt()
 
@@ -253,8 +277,8 @@ class ScreeningExperiment(nn.Module):
                         ]
                         enc = torch.stack(enc_list).sum(0)
                         print(f"    [enc t={t}] mean={enc.mean().item():.4f}  "
-                            f"std={enc.std().item():.4f}  "
-                            f"norm={enc.norm().item():.4f}")
+                              f"std={enc.std().item():.4f}  "
+                              f"norm={enc.norm().item():.4f}")
                         for s, (d, o) in enumerate(past_pairs):
                             enc_single = self.design_net.encoder(xi=d, y=o, t=[s+1])
                             enc_zero   = self.design_net.encoder(xi=d, y=torch.zeros(1, device=device), t=[s+1])

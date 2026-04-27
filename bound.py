@@ -18,6 +18,7 @@ def _log_py_given_z_student(
     sigma2_alpha0,
     sigma2_beta0,
     interaction_pairs=None,
+    z_interact_outer=None,
 ):
     num_outer, S, p = z_outer.shape
     T = y.shape[1]
@@ -34,9 +35,12 @@ def _log_py_given_z_student(
         i_idx = torch.tensor([i for i, j in interaction_pairs], device=z_outer.device)
         j_idx = torch.tensor([j for i, j in interaction_pairs], device=z_outer.device)
         X_interact = X_main[..., i_idx] * X_main[..., j_idx]
-        z_i = z_outer[..., i_idx]
-        z_j = z_outer[..., j_idx]
-        interact_active = z_i * z_j
+        if z_interact_outer is not None:
+            interact_active = z_interact_outer
+        else:
+            z_i = z_outer[..., i_idx]
+            z_j = z_outer[..., j_idx]
+            interact_active = z_i * z_j
         prior_var_interact = torch.where(
             interact_active.bool(),
             torch.tensor(scale_active ** 2,   device=z_outer.device),
@@ -154,6 +158,8 @@ class PriorContrastiveEstimation(MutualInformation):
         logit_l2_penalty=0.01,
         dense_rewards=False,
         interaction_pairs=None,
+        strong_heredity=False,
+        pi_interaction=0.5,
     ):
         super().__init__(num_outer_samples, data_source=data_source)
         self.num_inner_samples = num_inner_samples
@@ -163,6 +169,8 @@ class PriorContrastiveEstimation(MutualInformation):
         self.logit_l2_penalty  = logit_l2_penalty
         self.dense_rewards     = dense_rewards
         self.interaction_pairs = interaction_pairs
+        self.strong_heredity   = strong_heredity
+        self.pi_interaction    = pi_interaction
 
         self.sigma2_alpha0 = sigma2_alpha0
         if sigma2_beta0 is None:
@@ -170,7 +178,6 @@ class PriorContrastiveEstimation(MutualInformation):
         self.sigma2_beta0 = sigma2_beta0
 
     def _get_z_and_contrastive(self, primary_trace, num_z_contrastive):
-        """Extract z_pos, z_con, and the contrastive samples (shared across steps)."""
         z_pos = primary_trace.nodes["z"]["value"].float()
         z_pos_exp = z_pos.unsqueeze(1)
 
@@ -182,15 +189,34 @@ class PriorContrastiveEstimation(MutualInformation):
         z_con = torch.bernoulli(
             pi.unsqueeze(1).expand(-1, num_z_contrastive, -1)
         )
-        return z_pos_exp, z_con
 
-    def _student_log_prob_prefix(self, y_prefix, xi_prefix, z_pos_exp, z_con):
-        """Compute Student-t log prob for a trajectory prefix."""
+        zi_pos_exp = None
+        zi_con     = None
+        if self.strong_heredity and self.interaction_pairs and len(self.interaction_pairs) > 0:
+            ii = torch.tensor([i for i, _ in self.interaction_pairs], device=z_pos.device)
+            jj = torch.tensor([j for _, j in self.interaction_pairs], device=z_pos.device)
+
+            if "z_interact" in primary_trace.nodes:
+                zi_pos = primary_trace.nodes["z_interact"]["value"].float()
+            else:
+                parent = z_pos[..., ii] * z_pos[..., jj]
+                zi_pos = torch.bernoulli(self.pi_interaction * parent)
+            zi_pos_exp = zi_pos.unsqueeze(1)
+
+            parent_con = z_con[..., ii] * z_con[..., jj]
+            zi_con = torch.bernoulli(self.pi_interaction * parent_con)
+
+        return z_pos_exp, z_con, zi_pos_exp, zi_con
+
+    def _student_log_prob_prefix(self, y_prefix, xi_prefix,
+                                 z_pos_exp, z_con,
+                                 zi_pos_exp=None, zi_con=None):
         log_py_z_pos = _log_py_given_z_student(
             y_prefix, xi_prefix, z_pos_exp,
             self.scale_active, self.scale_inactive,
             self.sigma2_alpha0, self.sigma2_beta0,
             interaction_pairs=self.interaction_pairs,
+            z_interact_outer=zi_pos_exp,
         ).squeeze(1)
 
         log_py_z_con = _log_py_given_z_student(
@@ -198,25 +224,27 @@ class PriorContrastiveEstimation(MutualInformation):
             self.scale_active, self.scale_inactive,
             self.sigma2_alpha0, self.sigma2_beta0,
             interaction_pairs=self.interaction_pairs,
+            z_interact_outer=zi_con,
         )
         return log_py_z_pos, log_py_z_con
 
     def _student_log_prob(self, primary_trace, num_z_contrastive, p, T):
         y, xi_list = _extract_y_and_xi(primary_trace, self.num_outer_samples, T)
-        z_pos_exp, z_con = self._get_z_and_contrastive(primary_trace, num_z_contrastive)
-        return self._student_log_prob_prefix(y, xi_list, z_pos_exp, z_con)
+        z_pos_exp, z_con, zi_pos_exp, zi_con = self._get_z_and_contrastive(
+            primary_trace, num_z_contrastive
+        )
+        return self._student_log_prob_prefix(
+            y, xi_list, z_pos_exp, z_con, zi_pos_exp, zi_con
+        )
 
 
     def differentiable_loss(self, model, *args, **kwargs):
-        # Clear logits history before the rollout so we only collect
-        # logits from this forward pass.
         design_net = None
         for module in model.__self__.modules() if hasattr(model, '__self__') else []:
             if hasattr(module, '_logits_history'):
                 module._logits_history = []
                 design_net = module
                 break
-        # Fallback: walk the model if the above didn't find it
         if design_net is None:
             try:
                 m = model.__self__ if hasattr(model, '__self__') else model
@@ -232,7 +260,6 @@ class PriorContrastiveEstimation(MutualInformation):
         p = primary_trace.nodes["z"]["value"].shape[-1]
 
         if not self.dense_rewards:
-            # ── Terminal loss (original) ──
             log_py_z_pos, log_py_z_con = self._student_log_prob(
                 primary_trace, self.num_inner_samples, p, T
             )
@@ -243,22 +270,17 @@ class PriorContrastiveEstimation(MutualInformation):
             loss = (log_py_combined - log_py_z_pos).mean(0)
 
         else:
-            # ── Dense step-by-step loss ──
-            # Compute sPCE at each prefix h_1, h_2, ..., h_T.
-            # loss = Σ_t [sPCE(h_t) - sPCE(h_{t-1})]
-            # This telescopes to sPCE(h_T), giving the same total value,
-            # but each step gets a direct gradient signal through only
-            # one Gumbel-STE discretization instead of T chained ones.
             y_full, xi_full = _extract_y_and_xi(
                 primary_trace, self.num_outer_samples, T
             )
-            z_pos_exp, z_con = self._get_z_and_contrastive(
+            z_pos_exp, z_con, zi_pos_exp, zi_con = self._get_z_and_contrastive(
                 primary_trace, self.num_inner_samples
             )
-            # z tensors are sampled from the prior — no design gradients
-            # flow through them. Detach to save memory.
             z_pos_exp = z_pos_exp.detach()
             z_con = z_con.detach()
+            if zi_pos_exp is not None:
+                zi_pos_exp = zi_pos_exp.detach()
+                zi_con     = zi_con.detach()
 
             loss = torch.tensor(0.0, device=y_full.device)
             prev_spce = torch.zeros(
@@ -266,12 +288,11 @@ class PriorContrastiveEstimation(MutualInformation):
             )
 
             for t in range(1, T + 1):
-                # Prefix: y_1:t and xi_1:t
-                y_prefix = y_full[..., :t]          # [num_outer, t]
-                xi_prefix = xi_full[:t]             # list of t tensors
+                y_prefix = y_full[..., :t]
+                xi_prefix = xi_full[:t]
 
                 log_pos, log_con = self._student_log_prob_prefix(
-                    y_prefix, xi_prefix, z_pos_exp, z_con
+                    y_prefix, xi_prefix, z_pos_exp, z_con, zi_pos_exp, zi_con
                 )
 
                 log_pos_exp = log_pos.unsqueeze(1)
@@ -279,21 +300,11 @@ class PriorContrastiveEstimation(MutualInformation):
                     [log_pos_exp, log_con], dim=1
                 ).logsumexp(1)
 
-                spce_t = log_combined - log_pos     # [num_outer]
+                spce_t = log_combined - log_pos
 
-                # Per-step increment: sPCE(h_t) - sPCE(h_{t-1})
-                # Each increment is a separate term in the loss, giving
-                # autograd a direct gradient path to step t's design.
                 loss = loss + (spce_t - prev_spce).mean(0)
-                prev_spce = spce_t.detach()  # detach so gradients don't
-                                             # flow backward through
-                                             # previous steps' sPCE terms
+                prev_spce = spce_t.detach()
 
-            # loss now equals sPCE(h_T) numerically, but with richer gradients
-
-        # Identify design sites by NAME PREFIX (xi1, xi2, ...) rather than by
-        # the "subtype" msg field, which isn't always preserved by pyro's
-        # trace across versions. Using the name is guaranteed to work.
         design_sites = sorted(
             [name for name in primary_trace.nodes if name.startswith("xi")],
             key=lambda s: int(s[2:]) if s[2:].isdigit() else 0,
@@ -303,9 +314,6 @@ class PriorContrastiveEstimation(MutualInformation):
                 primary_trace.nodes[name]["value"].float()
                 for name in design_sites
             ])
-            # designs: [T, num_outer, p]  -- flatten rollouts into the design
-            # vector so the penalty measures similarity across time *within*
-            # a single rollout averaged over the batch.
             T_d = designs.shape[0]
             flat = designs.reshape(T_d, -1)
             norms = torch.norm(flat, dim=1, keepdim=True) + 1e-8
@@ -318,10 +326,6 @@ class PriorContrastiveEstimation(MutualInformation):
 
             loss = loss + self.diversity_penalty * avg_sim
 
-        # Logit L2 penalty: prevents logit saturation so that
-        # straight-through gradients remain alive. Without this,
-        # logits can grow unbounded, making the Gumbel noise
-        # irrelevant and killing adaptivity in some seeds.
         if self.logit_l2_penalty > 0.0 and design_net is not None:
             logits_list = getattr(design_net, '_logits_history', [])
             if logits_list:
