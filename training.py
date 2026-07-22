@@ -1,6 +1,9 @@
 import argparse
 import csv
+import json
+import math
 import os
+import time
 from datetime import datetime
 
 import numpy as np
@@ -55,6 +58,15 @@ def single_run(
     use_g_prior=False,
     strong_heredity=False,
     pi_interaction=0.5,
+    grad_clip_max_norm=1.0,
+    pe_dim=4,
+    mlp_depth=1,
+    proj_hidden=64,
+    log_every=10,
+    early_stop=False,
+    early_stop_patience=20,
+    early_stop_min_delta=0.001,
+    early_stop_min_steps_frac=0.5,
 ):
     if adam_betas_wd is None:
         adam_betas_wd = [0.9, 0.999, 0]
@@ -85,6 +97,9 @@ def single_run(
             encoding_dim=encoding_dim,
             hidden_dim=hidden_dim,
             encoder_type=encoder_type,
+            pe_dim=pe_dim,
+            mlp_depth=mlp_depth,
+            proj_hidden=proj_hidden,
         ).to(device)
 
         if static_checkpoint is not None:
@@ -175,7 +190,10 @@ def single_run(
         print(f"[Total-MI] Using PriorContrastiveEstimationTotalMI "
               f"(target I(theta; h_T), Gaussian likelihood).")
 
-    oed = OED(screening_model.model, scheduler, pce_loss)
+    oed = OED(
+        screening_model.model, scheduler, pce_loss,
+        grad_clip_max_norm=grad_clip_max_norm,
+    )
     os.makedirs(output_dir, exist_ok=True)
     run_id   = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(output_dir, f"loss_history_{run_id}.csv")
@@ -214,6 +232,14 @@ def single_run(
         "tau_start": tau_start,
         "tau_end": tau_end,
         "tau_anneal_frac": tau_anneal_frac,
+        "grad_clip_max_norm": grad_clip_max_norm,
+        "pe_dim": pe_dim,
+        "mlp_depth": mlp_depth,
+        "proj_hidden": proj_hidden,
+        "early_stop": early_stop,
+        "early_stop_patience": early_stop_patience,
+        "early_stop_min_delta": early_stop_min_delta,
+        "early_stop_min_steps_frac": early_stop_min_steps_frac,
     }
 
     print("\n" + "=" * 55)
@@ -224,6 +250,22 @@ def single_run(
     print("=" * 55 + "\n")
 
     loss_history = []
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    train_t0 = time.time()
+    diverged = False
+    last_eig_eval = float("nan")
+    last_eig_train = float("nan")
+    last_tau = tau_start
+
+    import copy
+    best_eig_eval = -float("inf")
+    best_step = 0
+    best_state_dict = None
+    no_improve_count = 0
+    early_stopped = False
+    early_stop_min_steps = int(num_steps * early_stop_min_steps_frac)
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -241,16 +283,45 @@ def single_run(
             loss = oed.step()
             loss = torch_item(loss)
             loss_history.append(loss)
+            if not math.isfinite(loss):
+                diverged = True
 
-            if i % 10 == 0:
-                eig_train  = -loss      
-                loss_eval = oed.evaluate_loss()    
-                eig_eval   = -loss_eval     
+            if i % log_every == 0 or i == num_steps - 1:
+                eig_train  = -loss
+                loss_eval = oed.evaluate_loss()
+                eig_eval   = -loss_eval
+                last_eig_train = eig_train
+                last_eig_eval  = eig_eval
+                last_tau       = tau
                 num_steps_range.set_description("EIG: {:.3f} τ: {:.3f}".format(eig_eval, tau))
                 writer.writerow([i, loss, loss_eval, eig_train, eig_eval, tau])
+                f.flush()
+
+                anneal_steps_local = max(1, int(num_steps * tau_anneal_frac))
+                if early_stop and i >= anneal_steps_local:
+                    if eig_eval > best_eig_eval + early_stop_min_delta:
+                        best_eig_eval = eig_eval
+                        best_step     = i
+                        best_state_dict = copy.deepcopy(screening_model.state_dict())
+                        no_improve_count = 0
+                    else:
+                        no_improve_count += 1
+
+                if early_stop and i >= early_stop_min_steps and \
+                   no_improve_count >= early_stop_patience:
+                    print(f"\n[early stop] step={i}/{num_steps} "
+                          f"best EIG={best_eig_eval:.4f}@step{best_step} "
+                          f"(no improvement for {no_improve_count} eval points)")
+                    early_stopped = True
+                    break
 
             if i % 1000 == 0 and i > 0:
                 scheduler.step()
+
+    if best_state_dict is not None:
+        screening_model.load_state_dict(best_state_dict)
+        print(f"[early stop] restored best model from step {best_step} "
+              f"(EIG_eval={best_eig_eval:.4f})")
 
     if len(loss_history) == 0:
         loss = torch_item(pce_loss.differentiable_loss(screening_model.model))
@@ -276,6 +347,47 @@ def single_run(
         model_path,
     )
     print(f"  Model saved to          : {model_path}")
+
+    train_wallclock_s = time.time() - train_t0
+    if torch.cuda.is_available():
+        gpu_mem_peak_mb = float(torch.cuda.max_memory_allocated()) / (1024.0 ** 2)
+        gpu_name = torch.cuda.get_device_name(0)
+    else:
+        gpu_mem_peak_mb = 0.0
+        gpu_name = "cpu"
+
+    summary_path = os.path.join(output_dir, f"training_summary_{run_id}.json")
+    summary = {
+        "run_id": run_id,
+        "model_file": os.path.basename(model_path),
+        "loss_history_file": os.path.basename(csv_path),
+        "params": params,
+        "training": {
+            "wallclock_s": train_wallclock_s,
+            "n_steps_completed": len(loss_history),
+            "n_steps_requested": num_steps,
+            "eig_train_final": last_eig_train,
+            "eig_eval_final": last_eig_eval,
+            "tau_final": last_tau,
+            "diverged": bool(diverged),
+            "early_stopped": bool(early_stopped),
+            "best_eig_eval": (None if best_state_dict is None
+                              else float(best_eig_eval)),
+            "best_step":     int(best_step),
+        },
+        "system": {
+            "gpu_name": gpu_name,
+            "gpu_mem_peak_MB": gpu_mem_peak_mb,
+            "device": str(device),
+        },
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(summary_path, "w") as fjs:
+        json.dump(summary, fjs, indent=2)
+    print(f"  Training summary saved   : {summary_path}")
+    print(f"  Wall-clock              : {train_wallclock_s:.1f} s")
+    print(f"  GPU mem peak            : {gpu_mem_peak_mb:.1f} MB")
+
     print("\n--- Encoding diagnostic (3 example runs) ---")
     try:
         screening_model.eval_policy(n_trace=3, verbose=True)
@@ -332,6 +444,31 @@ if __name__ == "__main__":
     parser.add_argument("--pi-interaction",        default=0.5, type=float,
                         help="Bernoulli prob for interaction activity within "
                              "the heredity-allowed set (only used if --strong-heredity).")
+    parser.add_argument("--grad-clip-max-norm",   default=1.0, type=float,
+                        help="Max gradient norm for clip_grad_norm_ (inf-norm). "
+                             "Set to 0 or a negative value to disable clipping.")
+    parser.add_argument("--pe-dim",               default=4,   type=int,
+                        help="Number of sinusoidal positional-encoding frequencies "
+                             "(only affects --encoder-type original; ignored by "
+                             "suff and canonical encoders).")
+    parser.add_argument("--mlp-depth",            default=1,   type=int,
+                        help="Number of hidden layers in encoder and emitter MLPs.")
+    parser.add_argument("--proj-hidden",          default=64,  type=int,
+                        help="Hidden width of the suff-encoder projection MLP.")
+    parser.add_argument("--log-every",            default=10,  type=int,
+                        help="Write a row of loss_history every N training steps. "
+                             "Last step is always logged.")
+    parser.add_argument("--early-stop",           action="store_true",
+                        help="Enable early stopping when EIG_eval plateaus. "
+                             "Saves and restores the best checkpoint by EIG_eval.")
+    parser.add_argument("--early-stop-patience", default=20, type=int,
+                        help="Number of consecutive eval points (each `log-every` "
+                             "steps) without improvement before stopping.")
+    parser.add_argument("--early-stop-min-delta", default=0.001, type=float,
+                        help="Minimum EIG_eval improvement to count as progress.")
+    parser.add_argument("--early-stop-min-steps-frac", default=0.5, type=float,
+                        help="Don't allow early stop before this fraction of "
+                             "num_steps (lets tau annealing finish).")
     parser.add_argument("--device",              default="cpu",  type=str)
     parser.add_argument("--output-dir",          default="results", type=str)
 
@@ -373,4 +510,13 @@ if __name__ == "__main__":
         use_g_prior=args.use_g_prior,
         strong_heredity=args.strong_heredity,
         pi_interaction=args.pi_interaction,
+        grad_clip_max_norm=args.grad_clip_max_norm,
+        pe_dim=args.pe_dim,
+        mlp_depth=args.mlp_depth,
+        proj_hidden=args.proj_hidden,
+        log_every=args.log_every,
+        early_stop=args.early_stop,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
+        early_stop_min_steps_frac=args.early_stop_min_steps_frac,
     )

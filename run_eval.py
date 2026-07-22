@@ -1,5 +1,9 @@
 import argparse
+import json
 import os
+import time
+from datetime import datetime
+
 import torch
 import pyro
 import numpy as np
@@ -16,6 +20,10 @@ from evaluate_inter import run_policy, gibbs_sampler
 def f1(tp, fp, fn):
     denom = 2 * tp + fp + fn
     return (2 * tp / denom) if denom > 0 else 0.0
+
+
+def precision(tp, fp):
+    return (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
 
 
 def metrics_from_z(z_post_mean, z_true, threshold=0.5):
@@ -35,6 +43,27 @@ def tpr(tp, fn):
     return (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
 
 
+def _summary(values):
+    arr = np.asarray(values, dtype=float)
+    n = arr.size
+    if n == 0:
+        return {"mean": float("nan"), "se": float("nan"),
+                "ci95_lo": float("nan"), "ci95_hi": float("nan"),
+                "median": float("nan"), "min": float("nan"), "max": float("nan"),
+                "n": 0}
+    m = float(arr.mean())
+    s = float(arr.std(ddof=1)) if n > 1 else 0.0
+    se = s / max(1.0, n ** 0.5)
+    return {
+        "mean": m, "se": se,
+        "ci95_lo": m - 1.96 * se, "ci95_hi": m + 1.96 * se,
+        "std": s,
+        "median": float(np.median(arr)),
+        "min": float(arr.min()), "max": float(arr.max()),
+        "n": int(n),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", required=True)
@@ -43,7 +72,15 @@ def main():
     ap.add_argument("--num-gibbs-samples", type=int, default=200)
     ap.add_argument("--burnin", type=int, default=100)
     ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--save-json", default=None,
+                    help="If given, write a structured eval summary "
+                         "(per-rollout vectors + per-seed CI) to this path.")
+    ap.add_argument("--eval-weak-heredity", action="store_true",
+                    help="Override strong_heredity=False at evaluation time. "
+                         "Ground truth is then sampled without the strong-heredity "
+                         "constraint. Used for the train-strong/eval-weak ablation cell.")
     args = ap.parse_args()
+    eval_t0 = time.time()
 
     torch.manual_seed(args.seed); pyro.set_rng_seed(args.seed); np.random.seed(args.seed)
 
@@ -73,6 +110,9 @@ def main():
             encoding_dim = p.get("encoding_dim", 16),
             hidden_dim   = p.get("hidden_dim", 64),
             encoder_type = p.get("encoder_type", "original"),
+            mlp_depth    = p.get("mlp_depth", 1),
+            pe_dim       = p.get("pe_dim", 4),
+            proj_hidden  = p.get("proj_hidden", 64),
         )
     elif dnt == "static":
         design_net = BatchDesignBaseline(T=p["T"], design_dim=p["num_factors"])
@@ -101,12 +141,18 @@ def main():
         sigma2_alpha0       = p.get("sigma2_alpha0", 3.0),
         sigma2_beta0        = p.get("sigma2_beta0", None),
         use_g_prior         = p.get("use_g_prior", False),
-        strong_heredity     = p.get("strong_heredity", False),
+        strong_heredity     = (False if args.eval_weak_heredity
+                               else p.get("strong_heredity", False)),
         pi_interaction      = p.get("pi_interaction", 0.5),
     )
+    if args.eval_weak_heredity:
+        print(f"[eval-weak-heredity] Overriding strong_heredity=False at eval time "
+              f"(trained with strong_heredity={p.get('strong_heredity', False)}).")
 
-    main_f1s, main_tprs, main_fdrs, em_list = [], [], [], []
-    int_f1s,  int_tprs,  int_fdrs           = [], [], []
+    main_f1s, main_tprs, main_fdrs, main_precs, em_list = [], [], [], [], []
+    int_f1s,  int_tprs,  int_fdrs,  int_precs           = [], [], [], []
+    z_post_main_list = []
+    z_true_main_list = []
     pairs = screening_model.interaction_pairs
 
     for r in range(args.num_rollouts):
@@ -133,11 +179,14 @@ def main():
             num_samples=args.num_gibbs_samples, burnin=args.burnin,
         )
         z_post = z_samples.float().mean(0)
+        z_post_main_list.append([float(v) for v in z_post])
+        z_true_main_list.append([int(v) for v in true_z])
 
         tp, fp, fn, em = metrics_from_z(z_post, true_z, args.threshold)
         main_f1s.append(f1(tp, fp, fn))
         main_tprs.append(tpr(tp, fn))
         main_fdrs.append(fdr(tp, fp))
+        main_precs.append(precision(tp, fp))
         em_list.append(em)
 
         if z_int_samples is not None:
@@ -154,6 +203,7 @@ def main():
         int_f1s.append(f1(tp_i, fp_i, fn_i))
         int_tprs.append(tpr(tp_i, fn_i))
         int_fdrs.append(fdr(tp_i, fp_i))
+        int_precs.append(precision(tp_i, fp_i))
 
     def ms(v):
         m = float(np.mean(v)); s = float(np.std(v)) / max(1, len(v) ** 0.5)
@@ -164,15 +214,66 @@ def main():
     print(f"  F1:          {ms(main_f1s)}")
     print(f"  TPR:         {ms(main_tprs)}")
     print(f"  FDR:         {ms(main_fdrs)}")
+    print(f"  Precision:   {ms(main_precs)}")
     print(f"  Exact Match: {ms(em_list)}")
     print()
     print("Interactions:")
     print(f"  F1:          {ms(int_f1s)}")
     print(f"  TPR:         {ms(int_tprs)}")
     print(f"  FDR:         {ms(int_fdrs)}")
+    print(f"  Precision:   {ms(int_precs)}")
     print()
     print(f"Rollouts:      {args.num_rollouts}")
     print("=" * 64)
+
+    if args.save_json:
+        eval_wallclock_s = time.time() - eval_t0
+        out = {
+            "model_path": os.path.abspath(args.model_path),
+            "training_params": p,
+            "eval_settings": {
+                "num_rollouts": args.num_rollouts,
+                "seed": args.seed,
+                "num_gibbs_samples": args.num_gibbs_samples,
+                "burnin": args.burnin,
+                "threshold": args.threshold,
+            },
+            "per_rollout_main": {
+                "F1":          [float(v) for v in main_f1s],
+                "TPR":         [float(v) for v in main_tprs],
+                "FDR":         [float(v) for v in main_fdrs],
+                "precision":   [float(v) for v in main_precs],
+                "exact_match": [float(v) for v in em_list],
+            },
+            "per_rollout_int": {
+                "F1":        [float(v) for v in int_f1s],
+                "TPR":       [float(v) for v in int_tprs],
+                "FDR":       [float(v) for v in int_fdrs],
+                "precision": [float(v) for v in int_precs],
+            },
+            "summary_main": {
+                "F1":          _summary(main_f1s),
+                "TPR":         _summary(main_tprs),
+                "FDR":         _summary(main_fdrs),
+                "precision":   _summary(main_precs),
+                "exact_match": _summary(em_list),
+            },
+            "summary_int": {
+                "F1":        _summary(int_f1s),
+                "TPR":       _summary(int_tprs),
+                "FDR":       _summary(int_fdrs),
+                "precision": _summary(int_precs),
+            },
+            "z_post_per_rollout": z_post_main_list,
+            "z_true_per_rollout": z_true_main_list,
+            "eval_wallclock_s": eval_wallclock_s,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_json)) or ".",
+                    exist_ok=True)
+        with open(args.save_json, "w") as fjs:
+            json.dump(out, fjs, indent=2)
+        print(f"  Eval JSON saved to: {args.save_json}")
 
 
 if __name__ == "__main__":

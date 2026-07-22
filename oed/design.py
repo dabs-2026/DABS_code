@@ -4,11 +4,12 @@ from pyro.infer.util import torch_item
 
 
 class OED:
-    def __init__(self, model, optim, loss, **kwargs):
+    def __init__(self, model, optim, loss, grad_clip_max_norm=1.0, **kwargs):
 
         self.model = model
         self.optim = optim
         self.loss = loss
+        self.grad_clip_max_norm = grad_clip_max_norm
         super().__init__(**kwargs)
 
         if not isinstance(optim, pyro.optim.PyroOptim):
@@ -32,8 +33,10 @@ class OED:
         params = set(
             site["value"].unconstrained() for site in param_capture.trace.nodes.values()
         )
-        if clip_grads:
-            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0, norm_type="inf")
+        if clip_grads and self.grad_clip_max_norm is not None and self.grad_clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                params, max_norm=self.grad_clip_max_norm, norm_type="inf"
+            )
 
         self.optim(params)
 

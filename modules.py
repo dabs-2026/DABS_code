@@ -5,18 +5,31 @@ import pyro
 def rmv(A, b):
     return torch.matmul(A, b.unsqueeze(-1)).squeeze(-1)
 
+def _build_mlp(input_dim, hidden_dim, output_dim, mlp_depth, final_layernorm=False):
+    if mlp_depth < 1:
+        raise ValueError(f"mlp_depth must be >= 1, got {mlp_depth}")
+    layers = [nn.Linear(input_dim, hidden_dim), nn.Softplus()]
+    for _ in range(mlp_depth - 1):
+        layers += [nn.Linear(hidden_dim, hidden_dim), nn.Softplus()]
+    layers += [nn.Linear(hidden_dim, output_dim)]
+    if final_layernorm:
+        layers += [nn.LayerNorm(output_dim)]
+    return nn.Sequential(*layers)
+
+
 class ScreeningEncoder(nn.Module):
-    def __init__(self, num_factors, encoding_dim, hidden_dim=64, pe_dim=4):
+    def __init__(self, num_factors, encoding_dim, hidden_dim=64, pe_dim=4, mlp_depth=1):
         super().__init__()
         self.encoding_dim = encoding_dim
         self.pe_dim = pe_dim
         input_dim = num_factors + 1 + 2 * pe_dim
 
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Softplus(),
-            nn.Linear(hidden_dim, encoding_dim),
-            nn.LayerNorm(encoding_dim),
+        self.network = _build_mlp(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=encoding_dim,
+            mlp_depth=mlp_depth,
+            final_layernorm=True,
         )
 
     def _positional(self, t_val, device, dtype):
@@ -54,7 +67,7 @@ class ScreeningEncoder(nn.Module):
         return out.reshape(*batch_shape, self.encoding_dim)
 
 class SufficientStatEncoder(nn.Module):
-    def __init__(self, num_factors, encoding_dim=32, proj_hidden=64):
+    def __init__(self, num_factors, encoding_dim=32, proj_hidden=64, mlp_depth=1):
         super().__init__()
         p = num_factors
         self.num_factors = p
@@ -80,9 +93,13 @@ class SufficientStatEncoder(nn.Module):
 
         self.projection = nn.Sequential(
             nn.LayerNorm(stat_dim),
-            nn.Linear(stat_dim, proj_hidden),
-            nn.Softplus(),
-            nn.Linear(proj_hidden, encoding_dim),
+            _build_mlp(
+                input_dim=stat_dim,
+                hidden_dim=proj_hidden,
+                output_dim=encoding_dim,
+                mlp_depth=mlp_depth,
+                final_layernorm=False,
+            ),
         )
 
     def forward(self, *design_obs_pairs):
@@ -232,12 +249,14 @@ class CanonicalEncoder(nn.Module):
         return logits
 
 class ScreeningEmitter(nn.Module):
-    def __init__(self, encoding_dim, num_factors, hidden_dim=64):
+    def __init__(self, encoding_dim, num_factors, hidden_dim=64, mlp_depth=1):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(encoding_dim, hidden_dim),
-            nn.Softplus(),
-            nn.Linear(hidden_dim, num_factors),
+        self.network = _build_mlp(
+            input_dim=encoding_dim,
+            hidden_dim=hidden_dim,
+            output_dim=num_factors,
+            mlp_depth=mlp_depth,
+            final_layernorm=False,
         )
         nn.init.zeros_(self.network[-1].bias)
 
@@ -394,6 +413,7 @@ class RandomDesignBaseline(SetEquivariantDesignNetwork):
 def build_screening_network(
     num_factors, encoding_dim=32, hidden_dim=64,
     encoder_type="original", proj_hidden=64, T_max=20,
+    pe_dim=4, mlp_depth=1,
 ):
     if encoder_type == "canonical":
         encoder = CanonicalEncoder(
@@ -415,6 +435,8 @@ def build_screening_network(
             num_factors=num_factors,
             encoding_dim=encoding_dim,
             hidden_dim=hidden_dim,
+            pe_dim=pe_dim,
+            mlp_depth=mlp_depth,
         )
         emitter_input = encoding_dim
     else:
@@ -422,6 +444,7 @@ def build_screening_network(
             num_factors=num_factors,
             encoding_dim=encoding_dim,
             proj_hidden=proj_hidden,
+            mlp_depth=mlp_depth,
         )
         emitter_input = encoding_dim
 
@@ -429,6 +452,7 @@ def build_screening_network(
         encoding_dim=emitter_input,
         num_factors=num_factors,
         hidden_dim=hidden_dim,
+        mlp_depth=mlp_depth,
     )
     empty_value = torch.zeros(num_factors)
 

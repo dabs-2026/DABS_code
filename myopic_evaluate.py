@@ -199,6 +199,7 @@ def run_simple_gibbs(
     scale_active, scale_inactive,
     alpha0, beta0, pi_prior,
     num_samples=200, burnin=100, threshold=0.5,
+    use_g_prior=False,
 ):
     T = X.shape[0]
     if interaction_pairs:
@@ -232,7 +233,10 @@ def run_simple_gibbs(
         prior_prec = torch.diag(1.0 / prior_var)
 
         XtX = X_full.T @ X_full
-        post_prec = XtX / sigma2 + prior_prec
+        if use_g_prior:
+            post_prec = (XtX + prior_prec) / sigma2
+        else:
+            post_prec = XtX / sigma2 + prior_prec
         try:
             L = torch.linalg.cholesky(post_prec)
             post_cov = torch.cholesky_inverse(L)
@@ -245,8 +249,13 @@ def run_simple_gibbs(
 
         residual = y - X_full @ theta
         rss = (residual * residual).sum()
-        alpha_n = alpha0 + T / 2.0
-        beta_n = beta0 + 0.5 * rss
+        if use_g_prior:
+            prior_quad = (theta * theta / prior_var).sum()
+            alpha_n = alpha0 + (T + d) / 2.0
+            beta_n  = beta0 + 0.5 * rss + 0.5 * prior_quad
+        else:
+            alpha_n = alpha0 + T / 2.0
+            beta_n  = beta0 + 0.5 * rss
         gamma_s = dist.Gamma(torch.tensor(alpha_n), torch.tensor(beta_n)).sample()
         sigma2 = 1.0 / gamma_s.clamp(min=1e-8)
 
@@ -311,6 +320,7 @@ def evaluate_myopic(
     n_y_samples=3,
     device="cpu",
     output_file=None,
+    use_g_prior=False,
 ):
     if sigma2_beta0 is None:
         sigma2_beta0 = (sigma2_alpha0 + 1.0) * (noise_scale ** 2)
@@ -357,6 +367,8 @@ def evaluate_myopic(
             torch.tensor(scale_active),
             torch.tensor(scale_inactive),
         )
+        if use_g_prior:
+            scale_main_t = scale_main_t * math.sqrt(true_sigma2)
         true_theta_main = torch.randn(p) * scale_main_t
 
         if interaction_pairs:
@@ -368,6 +380,8 @@ def evaluate_myopic(
                 torch.tensor(scale_active),
                 torch.tensor(scale_inactive),
             )
+            if use_g_prior:
+                scale_interact_t = scale_interact_t * math.sqrt(true_sigma2)
             true_theta_interact = torch.randn(len(interaction_pairs)) * scale_interact_t
         else:
             true_theta_interact = torch.tensor([])
@@ -393,6 +407,7 @@ def evaluate_myopic(
             pi_prior,
             num_samples=num_gibbs_samples, burnin=burnin,
             threshold=threshold,
+            use_g_prior=use_g_prior,
         )
 
         true_main = true_z.bool()
@@ -477,6 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-y-samples", type=int, default=3)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--use-g-prior", action="store_true")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -498,5 +514,6 @@ if __name__ == "__main__":
         n_y_samples=args.n_y_samples,
         device=args.device,
         output_file=args.output,
+        use_g_prior=args.use_g_prior,
     )
     print(f"\nTotal time: {(time.time() - t0)/60:.1f} min")

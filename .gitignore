@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# results and logs
+logs/
+dabs_curve_p15/
+dabs_5_2_hard_psweep/
+dabs_5_3_focus/
+dabs_baselines/
+dabs_ablations/
+*.pt
