@@ -75,8 +75,7 @@ Python 3.9 or newer.
 Case Study 1 uses the set encoder, `--encoder-type original`. Case Studies 2
 and 3 use the sufficient-statistics encoder, `--encoder-type suff`.
 
-`--use-g-prior` selects the sigma^2-scaled slab, beta | sigma^2 ~ N(0, sigma^2
-* scale^2), which is the prior used throughout the paper.
+`--use-g-prior` selects the sigma^2-scaled slab, `beta | sigma^2 ~ N(0, sigma^2 * scale^2)`, which is the prior used throughout the paper.
 
 ```
 python training.py \
