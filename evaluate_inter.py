@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import torch
 import pyro
 import pyro.distributions as dist
@@ -98,7 +99,13 @@ def gibbs_sampler(
     screening_model,
     num_samples=2000,
     burnin=500,
+    zk_update="mh",
+    legacy_zk=None,
 ):
+    if legacy_zk is not None:
+        zk_update = "legacy" if legacy_zk else "block"
+    if zk_update not in ("mh", "block", "legacy"):
+        raise ValueError(f"unknown zk_update={zk_update}")
     use_pi_hyperprior = screening_model.use_pi_hyperprior
     pi_beta_a         = screening_model.pi_beta_a
     pi_beta_b         = screening_model.pi_beta_b
@@ -181,10 +188,104 @@ def gibbs_sampler(
         sigma2 = 1.0 / gamma_sample.clamp(min=1e-8)
         return sigma2
 
+    def sample_sigma2_given_z(z, z_int):
+        prior_var = _prior_std(z, z_int) ** 2
+        Sz = torch.eye(T) + X @ torch.diag(prior_var) @ X.T
+        L = torch.linalg.cholesky(Sz + 1e-8 * torch.eye(T))
+        yv = y.reshape(-1, 1)
+        quad = (yv * torch.cholesky_solve(yv, L)).sum()
+        alpha_n = alpha0 + T / 2.0
+        beta_n = beta0 + 0.5 * quad
+        gamma_sample = dist.Gamma(
+            torch.tensor(float(alpha_n)),
+            torch.tensor(float(beta_n))
+        ).sample()
+        return 1.0 / gamma_sample.clamp(min=1e-8)
+
     pairs_touching = [[] for _ in range(p)]
     for idx, (i, j) in enumerate(interaction_pairs):
         pairs_touching[i].append(idx)
         pairs_touching[j].append(idx)
+
+    partner = {}
+    for idx, (i, j) in enumerate(interaction_pairs):
+        partner[(i, idx)] = j
+        partner[(j, idx)] = i
+
+    log_pi_int   = math.log(pi_interaction + 1e-12)
+    log_1m_pi_int = math.log(1.0 - pi_interaction + 1e-12)
+
+    def sample_zk_block(z, z_int, k, pi_val):
+        z1 = z.clone(); z1[k] = 1.0
+        z0 = z.clone(); z0[k] = 0.0
+
+        base = z_int.clone()
+        for idx in pairs_touching[k]:
+            base[idx] = 0.0
+
+        free = [idx for idx in pairs_touching[k]
+                if z[partner[(k, idx)]] > 0.5]
+
+        logs, states = [], []
+        for bits in itertools.product((0.0, 1.0), repeat=len(free)):
+            cand = base.clone()
+            lp = 0.0
+            for idx, val in zip(free, bits):
+                cand[idx] = val
+                lp += log_pi_int if val > 0.5 else log_1m_pi_int
+            logs.append(
+                _student_log_marginal(y, X, z1, interaction_pairs,
+                                      scale_active, scale_inactive,
+                                      alpha0, beta0, z_interact=cand) + lp
+            )
+            states.append(cand)
+
+        logs_t  = torch.stack(logs)
+        log_on  = torch.logsumexp(logs_t, dim=0) + math.log(pi_val)
+        log_off = (_student_log_marginal(y, X, z0, interaction_pairs,
+                                         scale_active, scale_inactive,
+                                         alpha0, beta0, z_interact=base)
+                   + math.log(1.0 - pi_val + 1e-10))
+
+        prob = torch.exp(log_on - torch.logaddexp(log_on, log_off)).clamp(0.0, 1.0)
+        if torch.bernoulli(prob) > 0.5:
+            w = torch.softmax(logs_t, dim=0)
+            return torch.tensor(1.0), states[int(torch.multinomial(w, 1).item())]
+        return torch.tensor(0.0), base
+
+    def sample_zk_mh(z, z_int, k, pi_val):
+        free = [idx for idx in pairs_touching[k]
+                if z[partner[(k, idx)]] > 0.5]
+
+        base = z_int.clone()
+        for idx in pairs_touching[k]:
+            base[idx] = 0.0
+
+        if z[k] > 0.5:
+            cur_z, cur_int = z, z_int
+            prop_z = z.clone(); prop_z[k] = 0.0
+            prop_int = base
+            log_odds = math.log(1.0 - pi_val + 1e-10) - math.log(pi_val)
+        else:
+            cur_z, cur_int = z, base
+            prop_z = z.clone(); prop_z[k] = 1.0
+            prop_int = base.clone()
+            for idx in free:
+                prop_int[idx] = float(torch.bernoulli(
+                    torch.tensor(pi_interaction)).item())
+            log_odds = math.log(pi_val) - math.log(1.0 - pi_val + 1e-10)
+
+        log_cur = _student_log_marginal(y, X, cur_z, interaction_pairs,
+                                        scale_active, scale_inactive,
+                                        alpha0, beta0, z_interact=cur_int)
+        log_prop = _student_log_marginal(y, X, prop_z, interaction_pairs,
+                                         scale_active, scale_inactive,
+                                         alpha0, beta0, z_interact=prop_int)
+
+        log_alpha = log_prop - log_cur + log_odds
+        if torch.log(torch.rand(1)).item() < log_alpha.item():
+            return prop_z[k].clone(), prop_int
+        return cur_z[k].clone(), cur_int
 
     def sample_zk_given_rest(z, z_int, k, pi_val):
         z1 = z.clone(); z1[k] = 1.0
@@ -259,11 +360,15 @@ def gibbs_sampler(
             print(f"    Step {step:>4}/{total_steps}  "
                   f"active={active}  sigma={sigma2.item()**0.5:.4f}")
 
-        theta  = sample_theta_given_z_sigma2(z, z_int, sigma2)
-        sigma2 = sample_sigma2_given_z_theta(z, z_int, theta)
-
-        for k in range(p):
-            z[k] = sample_zk_given_rest(z, z_int, k, pi if not use_pi_hyperprior else pi)
+        if strong_heredity and num_interactions > 0 and zk_update == "mh":
+            for k in range(p):
+                z[k], z_int = sample_zk_mh(z, z_int, k, pi)
+        elif strong_heredity and num_interactions > 0 and zk_update == "block":
+            for k in range(p):
+                z[k], z_int = sample_zk_block(z, z_int, k, pi)
+        else:
+            for k in range(p):
+                z[k] = sample_zk_given_rest(z, z_int, k, pi)
 
         if strong_heredity and num_interactions > 0:
             parent_now = z[ii] * z[jj]
@@ -280,6 +385,13 @@ def gibbs_sampler(
                 torch.tensor(a_post),
                 torch.tensor(b_post)
             ).sample().item()
+
+        if use_g_prior:
+            sigma2 = sample_sigma2_given_z(z, z_int)
+            theta = sample_theta_given_z_sigma2(z, z_int, sigma2)
+        else:
+            theta = sample_theta_given_z_sigma2(z, z_int, sigma2)
+            sigma2 = sample_sigma2_given_z_theta(z, z_int, theta)
 
         if step >= burnin:
             z_samples.append(z.clone())

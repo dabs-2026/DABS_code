@@ -39,7 +39,7 @@ case $CASE in
     OUTBASE=dabs_curve_p15
     STATIC_DIR=$OUTBASE/static_T${T}_seed${SEED}
     DABS_DIR=$OUTBASE/dabs_original_T${T}_seed${SEED}
-    DABS_ENC=suff ;;
+    DABS_ENC=original ;;
  2) MODEL="--noise-scale 0.5 --scale-active 1.0 --expected-active 0.2 --sigma2-beta0 1.0 --pi-beta-a 4 --pi-beta-b 6"
     HEREDITY="--strong-heredity"
     OUTBASE=dabs_5_2_hard_psweep
